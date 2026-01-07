@@ -469,7 +469,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (sellButton != null)
                     sellButton.Opacity = (armedDirection == ArmDirection.Short && isArmed) ? (blinkOn ? 1 : 0.55) : 1;
                 if (closeButton != null)
-                    closeButton.IsEnabled = Position.MarketPosition != MarketPosition.Flat || entryOrder != null;
+                {
+                    closeButton.IsEnabled = isArmed || Position.MarketPosition != MarketPosition.Flat || entryOrder != null;
+                    closeButton.IsHitTestVisible = true;
+                }
                 if (beButton != null)
                     beButton.IsEnabled = Position.MarketPosition != MarketPosition.Flat && stopOrder != null;
             });
