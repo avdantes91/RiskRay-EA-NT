@@ -1026,7 +1026,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string GetQtyLabel()
         {
             int qty = GetDisplayQuantity();
-            return $"{qty} contracts";
+            string rrText = GetRiskRewardText();
+            // Entry label shows qty and current R multiple.
+            return string.IsNullOrEmpty(rrText) ? $"{qty} contracts" : $"{qty} contracts | {rrText}";
         }
 
         private string GetStopLabel()
@@ -1035,10 +1037,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             // now we always compute against live entry reference (armed: bid/ask/last; in position: average fill) and include commission.
             int qty = Math.Max(GetDisplayQuantity(), 0);
             double entryRef = GetEntryReferenceForRisk();
-            double stopDistanceTicks = Math.Abs(entryRef - stopPrice) / TickSize();
+            double stopDistanceTicks = GetStopDistanceTicks(entryRef);
             double riskPerContract = (stopDistanceTicks * TickValue()) + (CommissionMode == CommissionModeOption.On ? CommissionPerContractRoundTurn : 0);
             double totalRisk = riskPerContract * qty;
-            string label = $"SL: -{CurrencySymbol()}{totalRisk:F2}";
+            string distanceText = FormatPointsAndTicks(stopDistanceTicks);
+            string label = $"SL: -{CurrencySymbol()}{totalRisk:F2} ({distanceText})";
             if (totalRisk > MaxRiskWarningUSD)
                 label = $"!! {label} !!";
             return label;
@@ -1047,8 +1050,44 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string GetTargetLabel()
         {
             int qty = Math.Max(GetDisplayQuantity(), 0);
-            double reward = Math.Abs(targetPrice - entryPrice) / TickSize() * TickValue() * qty;
+            double entryRef = GetEntryReferenceForRisk();
+            double reward = Math.Abs(targetPrice - entryRef) / TickSize() * TickValue() * qty;
             return $"TP: +{CurrencySymbol()}{reward:F2}";
+        }
+
+        private string GetRiskRewardText()
+        {
+            double entryRef = GetEntryReferenceForRisk();
+            double stopTicks = GetStopDistanceTicks(entryRef);
+            if (stopTicks <= double.Epsilon)
+                return "R—";
+
+            double rewardTicks = Math.Abs(targetPrice - entryRef) / TickSize();
+            double rr = rewardTicks / stopTicks;
+            if (Math.Abs(rr - 1.0) < 0.005)
+                return "R1";
+            return $"R{rr:F2}";
+        }
+
+        private double GetStopDistanceTicks(double entryRef)
+        {
+            return Math.Abs(entryRef - stopPrice) / TickSize();
+        }
+
+        private string FormatPointsAndTicks(double stopDistanceTicks)
+        {
+            // Append stop distance as points.ticks (e.g., 20.3 where .3 = ticks past whole point)
+            double stopPoints = stopDistanceTicks * TickSize();
+            double wholePoints = Math.Floor(stopPoints + 1e-9);
+            int ticksPerPoint = Math.Max(1, (int)Math.Round(1.0 / TickSize()));
+            int remainingTicks = (int)Math.Round((stopPoints - wholePoints) / TickSize());
+            remainingTicks = Math.Max(0, Math.Min(remainingTicks, ticksPerPoint - 1));
+            if (remainingTicks >= ticksPerPoint)
+            {
+                wholePoints += 1;
+                remainingTicks = 0;
+            }
+            return $"{wholePoints}.{remainingTicks}";
         }
 
         private void CreateOrUpdateLabel(string tag, double price, string text, Brush brush)
