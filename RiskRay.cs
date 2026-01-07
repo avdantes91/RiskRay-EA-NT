@@ -159,6 +159,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "LabelOffsetPixels", Order = 12, GroupName = "Labels")]
         public int LabelOffsetPixels { get; set; }
 
+        [Range(0, 200), NinjaScriptProperty]
+        [Display(Name = "LabelBarsRightOffset", Order = 13, GroupName = "Labels")]
+        public int LabelBarsRightOffset { get; set; }
+
         #endregion
 
         protected override void OnStateChange()
@@ -188,6 +192,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MaxRiskWarningUSD = 200;
                 LabelOffsetTicks = 2;
                 LabelOffsetPixels = 14;
+                LabelBarsRightOffset = 8;
             }
             else if (State == State.Configure)
             {
@@ -1090,6 +1095,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             return $"{wholePoints}.{remainingTicks}";
         }
 
+        private int GetLabelBarsAgo()
+        {
+            int bars = Math.Max(1, LabelBarsRightOffset);
+            return -bars;
+        }
+
         private void CreateOrUpdateLabel(string tag, double price, string text, Brush brush)
         {
             // Offset in ticks, scaled up using pixel preference (fallback tick-based approach for NT8 compatibility).
@@ -1106,7 +1117,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             offsetPrice = RoundToTick(offsetPrice);
 
-            var label = Draw.Text(this, tag, text, 0, offsetPrice, brush);
+            int barsAgo = GetLabelBarsAgo();
+            var label = Draw.Text(this, tag, text, barsAgo, offsetPrice, brush);
             if (label != null)
                 TrackDrawObject(label);
         }
