@@ -108,6 +108,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lastDragMoveLogStop = DateTime.MinValue;
         private DateTime lastDragMoveLogTarget = DateTime.MinValue;
         private bool chartEventsAttached;
+        private bool isBeDialogOpen;
+        private DateTime lastBeDialogTime = DateTime.MinValue;
 
         #region Properties
 
@@ -880,6 +882,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 || (Position.MarketPosition == MarketPosition.Short && marketRef >= avgEntryPrice))
             {
                 LogInfo("BE blocked: position not in profit");
+                ShowBeBlockedDialog();
                 return;
             }
 
@@ -1373,6 +1376,32 @@ namespace NinjaTrader.NinjaScript.Strategies
             fatalError = true;
             fatalErrorMessage = $"{context}: {ex.Message} | {ex.StackTrace}";
             Print($"[RiskRay][FATAL] {fatalErrorMessage}");
+        }
+
+        private void ShowBeBlockedDialog()
+        {
+            // Throttle dialog to avoid spamming
+            if (isBeDialogOpen)
+                return;
+            if ((DateTime.Now - lastBeDialogTime).TotalSeconds < 2)
+                return;
+
+            if (ChartControl == null)
+                return;
+
+            isBeDialogOpen = true;
+            ChartControl.Dispatcher.InvokeAsync(() =>
+            {
+                try
+                {
+                    MessageBox.Show("BE is not allowed because the position is not in profit yet. Needs at least +1 tick.", "RiskRay - Break Even", MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                finally
+                {
+                    lastBeDialogTime = DateTime.Now;
+                    isBeDialogOpen = false;
+                }
+            });
         }
 
         private void LogDebugDrag(string prefix, double price)
