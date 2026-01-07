@@ -163,6 +163,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "LabelBarsRightOffset", Order = 13, GroupName = "Labels")]
         public int LabelBarsRightOffset { get; set; }
 
+        [Range(-50, 50), NinjaScriptProperty]
+        [Display(Name = "LabelHorizontalShift", Order = 14, GroupName = "Labels")]
+        public int LabelHorizontalShift { get; set; }
+
         #endregion
 
         protected override void OnStateChange()
@@ -193,6 +197,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 LabelOffsetTicks = 2;
                 LabelOffsetPixels = 14;
                 LabelBarsRightOffset = 25;
+                LabelHorizontalShift = 0;
             }
             else if (State == State.Configure)
             {
@@ -1097,8 +1102,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private int GetLabelBarsAgo()
         {
-            int bars = Math.Max(1, LabelBarsRightOffset);
-            return -bars;
+            int baseBarsRight = Math.Max(0, LabelBarsRightOffset);
+            int barsAgo = -baseBarsRight - LabelHorizontalShift;
+            // Clamp to avoid extreme placements while keeping consistent alignment
+            barsAgo = Math.Max(-200, Math.Min(200, barsAgo));
+            return barsAgo;
         }
 
         private void CreateOrUpdateLabel(string tag, double price, string text, Brush brush)
