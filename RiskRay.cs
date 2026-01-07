@@ -641,6 +641,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             isArmed = true;
             hasPendingEntry = false;
             blinkOn = true;
+            blinkBuy = direction == ArmDirection.Long;
+            blinkSell = direction == ArmDirection.Short;
+            if (blinkTimer == null)
+            {
+                StartBlinkTimer();
+                LogDebug("Blink: start timer");
+            }
+            LogDebug(direction == ArmDirection.Long ? "Blink: Long ARMED -> blinking BUY" : "Blink: Short ARMED -> blinking SELL");
             InitializeLinesForDirection(direction);
             UpdateUiState();
             LogInfo($"{direction} ARMED");
@@ -652,6 +660,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             armedDirection = ArmDirection.None;
             hasPendingEntry = false;
             blinkOn = false;
+            blinkBuy = false;
+            blinkSell = false;
+            LogDebug("Blink: disarmed -> stop blinking");
             isDraggingStop = false;
             isDraggingTarget = false;
             if (removeLines)
