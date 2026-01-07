@@ -167,6 +167,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "LabelHorizontalShift", Order = 14, GroupName = "Labels")]
         public int LabelHorizontalShift { get; set; }
 
+        [Range(0, int.MaxValue), NinjaScriptProperty]
+        [Display(Name = "BE Plus Ticks", Order = 15, GroupName = "RiskRay")]
+        public int BreakEvenPlusTicks { get; set; }
+
         #endregion
 
         protected override void OnStateChange()
@@ -198,6 +202,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 LabelOffsetPixels = 14;
                 LabelBarsRightOffset = 25;
                 LabelHorizontalShift = 0;
+                BreakEvenPlusTicks = 0;
             }
             else if (State == State.Configure)
             {
@@ -862,11 +867,25 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void MoveStopToBreakEven()
         {
             if (Position.MarketPosition == MarketPosition.Flat || stopOrder == null)
+            {
+                LogInfo("BE failed: no working stop order");
                 return;
+            }
+
+            double marketRef = Position.MarketPosition == MarketPosition.Long ? GetCurrentBid() : GetCurrentAsk();
+            if (marketRef <= 0)
+                marketRef = Close[0];
+
+            if ((Position.MarketPosition == MarketPosition.Long && marketRef <= avgEntryPrice)
+                || (Position.MarketPosition == MarketPosition.Short && marketRef >= avgEntryPrice))
+            {
+                LogInfo("BE blocked: position not in profit");
+                return;
+            }
 
             double newStop = Position.MarketPosition == MarketPosition.Long
-                ? avgEntryPrice + BreakEvenOffsetTicks * TickSize()
-                : avgEntryPrice - BreakEvenOffsetTicks * TickSize();
+                ? avgEntryPrice + (BreakEvenPlusTicks * TickSize())
+                : avgEntryPrice - (BreakEvenPlusTicks * TickSize());
 
             stopPrice = RoundToTick(newStop);
             bool clamped;
@@ -879,10 +898,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             stopLineDirty = true;
 
-            SafeExecute("ChangeOrder-BE", () => ChangeOrder(stopOrder, stopOrder.Quantity, stopOrder.LimitPrice, stopPrice));
+            if (IsOrderActive(stopOrder))
+            {
+                SafeExecute("ChangeOrder-BE", () => ChangeOrder(stopOrder, stopOrder.Quantity, stopOrder.LimitPrice, stopPrice));
+                LogInfo($"BE pressed: stop moved to {stopPrice:F2}" + (clamped ? " (clamped)" : string.Empty));
+            }
+            else
+            {
+                LogInfo("BE failed: no working stop order");
+            }
+
             ApplyLineUpdates();
             UpdateLabelsOnly();
-            LogInfo($"BE pressed: stop moved to {stopPrice:F2}" + (clamped ? " (clamped)" : string.Empty));
         }
 
         private void HandlePositionClosed(string reason)
