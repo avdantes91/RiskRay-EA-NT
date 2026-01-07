@@ -119,6 +119,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lastBeDialogTime = DateTime.MinValue;
         private bool blinkBuy;
         private bool blinkSell;
+        private int blinkTickCounter;
 
         #region Properties
 
@@ -186,6 +187,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "TrailOffsetTicks", Order = 16, GroupName = "Trade Management")]
         public int TrailOffsetTicks { get; set; }
 
+        [NinjaScriptProperty]
+        [Display(Name = "DebugBlink", Order = 17, GroupName = "Debug")]
+        public bool DebugBlink { get; set; }
+
         #endregion
 
         protected override void OnStateChange()
@@ -219,6 +224,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 LabelHorizontalShift = 0;
                 BreakEvenPlusTicks = 0;
                 TrailOffsetTicks = 20;
+                DebugBlink = false;
             }
             else if (State == State.Configure)
             {
@@ -496,6 +502,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     buyButton.Opacity = blinkBuy ? (blinkOn ? 1 : 0.55) : 1;
                 if (sellButton != null)
                     sellButton.Opacity = blinkSell ? (blinkOn ? 1 : 0.55) : 1;
+                if (DebugBlink)
+                    Print($"[RiskRay][DEBUG] UpdateUiState: blinkBuy={blinkBuy} blinkSell={blinkSell} phase={(blinkOn ? "on" : "off")}");
                 if (closeButton != null)
                 {
                     closeButton.IsEnabled = isArmed || Position.MarketPosition != MarketPosition.Flat || entryOrder != null;
@@ -522,6 +530,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 blinkBuy = isArmed && armedDirection == ArmDirection.Long;
                 blinkSell = isArmed && armedDirection == ArmDirection.Short;
+                if (DebugBlink)
+                    Print($"[RiskRay][DEBUG] UpdateArmButtonsUI: blinkBuy={blinkBuy} blinkSell={blinkSell} phase={(blinkOn ? "on" : "off")} btnNull buy:{buyButton == null} sell:{sellButton == null}");
                 if (buyButton != null)
                     buyButton.Content = (isArmed && armedDirection == ArmDirection.Long) ? "BUY ARMED" : "BUY";
                 if (sellButton != null)
@@ -538,19 +548,38 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (blinkTimer != null)
                 return;
 
-            blinkTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
-            blinkTimer.Tick += (s, e) =>
-            {
-                SafeExecute("BlinkTimer", () =>
-                {
-                    if (!isArmed)
-                        return;
+            if (ChartControl == null || ChartControl.Dispatcher == null)
+                return;
 
-                    blinkOn = !blinkOn;
-                    UpdateUiState();
-                });
-            };
-            blinkTimer.Start();
+            ChartControl.Dispatcher.InvokeAsync(() =>
+            {
+                if (blinkTimer != null)
+                    return;
+
+                blinkTimer = new DispatcherTimer(DispatcherPriority.Normal, ChartControl.Dispatcher)
+                {
+                    Interval = TimeSpan.FromMilliseconds(500)
+                };
+                blinkTimer.Tick += (s, e) =>
+                {
+                    blinkTickCounter++;
+                    SafeExecute("BlinkTimer", () =>
+                    {
+                        if (!isArmed)
+                            return;
+
+                        blinkOn = !blinkOn;
+                        if (DebugBlink && blinkTickCounter % 10 == 0)
+                        {
+                            Print($"[RiskRay][DEBUG] Blink tick #{blinkTickCounter} flags: buy={blinkBuy} sell={blinkSell} phase={(blinkOn ? "on" : "off")} btns null? buy:{buyButton == null} sell:{sellButton == null}");
+                        }
+                        UpdateUiState();
+                    });
+                };
+                blinkTimer.Start();
+                if (DebugBlink)
+                    Print("[RiskRay][DEBUG] Blink: start timer (500ms)");
+            });
         }
 
         private void StopBlinkTimer()
@@ -559,6 +588,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
 
             blinkTimer.Stop();
+            blinkTimer.Tick -= null;
             blinkTimer = null;
         }
 
@@ -643,6 +673,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             blinkOn = true;
             blinkBuy = direction == ArmDirection.Long;
             blinkSell = direction == ArmDirection.Short;
+            blinkTickCounter = 0;
             if (blinkTimer == null)
             {
                 StartBlinkTimer();
@@ -662,6 +693,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             blinkOn = false;
             blinkBuy = false;
             blinkSell = false;
+            blinkTickCounter = 0;
             LogDebug("Blink: disarmed -> stop blinking");
             isDraggingStop = false;
             isDraggingTarget = false;
