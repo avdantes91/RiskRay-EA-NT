@@ -506,6 +506,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 if (beButton != null)
                     beButton.IsEnabled = Position.MarketPosition != MarketPosition.Flat && stopOrder != null;
+
+                UpdateArmButtonsUI();
+            });
+        }
+
+        private void UpdateArmButtonsUI()
+        {
+            if (ChartControl == null || !uiLoaded)
+                return;
+
+            ChartControl.Dispatcher.InvokeAsync(() =>
+            {
+                if (buyButton != null)
+                    buyButton.Content = (isArmed && armedDirection == ArmDirection.Long) ? "BUY ARMED" : "BUY";
+                if (sellButton != null)
+                    sellButton.Content = (isArmed && armedDirection == ArmDirection.Short) ? "SELL ARMED" : "SELL";
             });
         }
 
