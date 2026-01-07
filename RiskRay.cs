@@ -155,6 +155,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "LabelOffsetTicks", Order = 11, GroupName = "Parameters")]
         public int LabelOffsetTicks { get; set; }
 
+        [Range(0, 100), NinjaScriptProperty]
+        [Display(Name = "LabelOffsetPixels", Order = 12, GroupName = "Labels")]
+        public int LabelOffsetPixels { get; set; }
+
         #endregion
 
         protected override void OnStateChange()
@@ -183,11 +187,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 fatalErrorMessage = null;
                 MaxRiskWarningUSD = 200;
                 LabelOffsetTicks = 2;
+                LabelOffsetPixels = 14;
             }
             else if (State == State.Configure)
-            {
-            }
-            else if (State == State.DataLoaded)
             {
             }
             else if (State == State.Historical)
@@ -1051,20 +1053,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void CreateOrUpdateLabel(string tag, double price, string text, Brush brush)
         {
-            double offsetPrice = price;
-            double offsetTicks = LabelOffsetTicks * TickSize();
+            // Offset in ticks, scaled up using pixel preference (fallback tick-based approach for NT8 compatibility).
+            double tickOffset = Math.Max(LabelOffsetTicks, LabelOffsetPixels);
+            double offsetTicks = tickOffset;
             MarketPosition dir = GetWorkingDirection();
             bool isStop = tag == StopLabelTag;
 
-            // Vertical offset for readability: depends on long/short and SL/TP
+            double offsetPrice = price;
             if (dir == MarketPosition.Long)
-            {
-                offsetPrice = isStop ? price - offsetTicks : price + offsetTicks;
-            }
+                offsetPrice = isStop ? price - offsetTicks * TickSize() : price + offsetTicks * TickSize();
             else if (dir == MarketPosition.Short)
-            {
-                offsetPrice = isStop ? price + offsetTicks : price - offsetTicks;
-            }
+                offsetPrice = isStop ? price + offsetTicks * TickSize() : price - offsetTicks * TickSize();
+
             offsetPrice = RoundToTick(offsetPrice);
 
             var label = Draw.Text(this, tag, text, 0, offsetPrice, brush);
