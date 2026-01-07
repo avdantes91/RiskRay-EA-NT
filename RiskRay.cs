@@ -679,8 +679,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 stopPrice = stop;
                 SetLinePrice(stopLine, stopPrice);
                 LogDebugDrag("DragMove SL ->", stopPrice);
-                if (stopOrder != null && stopOrder.OrderState == OrderState.Working)
-                    SafeExecute("ChangeOrder-StopDrag", () => ChangeOrder(stopOrder, stopOrder.Quantity, stopOrder.LimitPrice, stopPrice));
+                if (IsOrderActive(stopOrder) && Position.MarketPosition != MarketPosition.Flat)
+                {
+                    double currentStop = stopOrder.StopPrice;
+                    if (Math.Abs(currentStop - stopPrice) >= TickSize() / 8)
+                    {
+                        SafeExecute("ChangeOrder-StopDrag", () => ChangeOrder(stopOrder, stopOrder.Quantity, stopOrder.LimitPrice, stopPrice));
+                        LogInfo($"SL modified -> {stopPrice:F2}");
+                    }
+                }
             }
             else
             {
@@ -1312,8 +1319,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 targetLineDirty = false;
                 if (clamped)
                     LogClampOnce("Line clamped at drag end");
-                if (stopOrder != null && stopOrder.OrderState == OrderState.Working)
+                if (IsOrderActive(stopOrder) && Position.MarketPosition != MarketPosition.Flat)
+                {
                     SafeExecute("ChangeOrder-StopDragEnd", () => ChangeOrder(stopOrder, stopOrder.Quantity, stopOrder.LimitPrice, stopPrice));
+                    LogInfo($"SL modified -> {stopPrice:F2}");
+                }
                 if (targetOrder != null && targetOrder.OrderState == OrderState.Working)
                     SafeExecute("ChangeOrder-TargetDragEnd", () => ChangeOrder(targetOrder, targetOrder.Quantity, targetPrice, targetOrder.StopPrice));
                 UpdateLabelsOnly();
