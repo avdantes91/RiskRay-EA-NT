@@ -192,7 +192,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MaxRiskWarningUSD = 200;
                 LabelOffsetTicks = 2;
                 LabelOffsetPixels = 14;
-                LabelBarsRightOffset = 13;
+                LabelBarsRightOffset = 25;
             }
             else if (State == State.Configure)
             {
