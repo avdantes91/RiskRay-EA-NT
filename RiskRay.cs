@@ -108,6 +108,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lastDragMoveLogStop = DateTime.MinValue;
         private DateTime lastDragMoveLogTarget = DateTime.MinValue;
         private bool chartEventsAttached;
+        private string cachedEntryLabelText;
+        private string cachedStopLabelText;
+        private string cachedTargetLabelText;
+        private string cachedQtyLabelText;
+        private string cachedRrLabelText;
+        private DateTime lastLabelSkipLogTime = DateTime.MinValue;
         private bool isBeDialogOpen;
         private DateTime lastBeDialogTime = DateTime.MinValue;
 
@@ -1047,7 +1053,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!HasActiveLines())
                 return;
 
-            string entryLabel = GetQtyLabel();
+            string entryLabel = GetEntryLabelSafe();
             string stopLbl = GetStopLabel();
             string targetLbl = GetTargetLabel();
 
@@ -1078,64 +1084,170 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        private string GetEntryLabelSafe()
+        {
+            string qtyLabel = GetQtyLabel();
+            string rrText = GetRiskRewardText();
+            string combined;
+            if (string.IsNullOrEmpty(qtyLabel) || qtyLabel == "0 contracts")
+                qtyLabel = cachedQtyLabelText ?? "CALC…";
+
+            if (string.IsNullOrEmpty(rrText) || rrText == "R0.00" || rrText == "R—")
+                rrText = cachedRrLabelText ?? "R?";
+
+            combined = $"{qtyLabel} | {rrText}";
+            cachedEntryLabelText = combined;
+            return combined;
+        }
+
         private string GetQtyLabel()
         {
-            int qty = GetDisplayQuantity();
-            string rrText = GetRiskRewardText();
-            // Entry label shows qty and current R multiple.
-            return string.IsNullOrEmpty(rrText) ? $"{qty} contracts" : $"{qty} contracts | {rrText}";
+            if (!TryComputeSizing(out double tick, out double tickValue, out double entryRef, out string reason))
+            {
+                return UseCachedOrPlaceholder(ref cachedQtyLabelText, reason);
+            }
+
+            double stopTicks = Math.Abs(entryPrice - stopPrice) / tick;
+            double perContractRisk = (stopTicks * tickValue) + (CommissionMode == CommissionModeOption.On ? CommissionPerContractRoundTurn : 0);
+            double rawQty = perContractRisk > 0 ? FixedRiskUSD / perContractRisk : 0;
+            int roundedQty = (int)Math.Floor(rawQty + 0.5);
+            int cappedQty = Math.Min(roundedQty, MaxContracts);
+
+            string label;
+            if (cappedQty < 1)
+                label = $"{rawQty:F2} (min 1)";
+            else
+                label = $"{cappedQty} contracts";
+
+            cachedQtyLabelText = label;
+            return label;
         }
 
         private string GetStopLabel()
         {
-            // Previously risk could show 0 when SL moved because we were using stale entry ref and/or qty zero;
-            // now we always compute against live entry reference (armed: bid/ask/last; in position: average fill) and include commission.
-            int qty = Math.Max(GetDisplayQuantity(), 0);
-            double entryRef = GetEntryReferenceForRisk();
-            double stopDistanceTicks = GetStopDistanceTicks(entryRef);
-            double riskPerContract = (stopDistanceTicks * TickValue()) + (CommissionMode == CommissionModeOption.On ? CommissionPerContractRoundTurn : 0);
-            double totalRisk = riskPerContract * qty;
+            if (!TryComputeSizing(out double tick, out double tickValue, out double entryRef, out string reason))
+                return UseCachedOrPlaceholder(ref cachedStopLabelText, reason);
+
+            double stopDistanceTicks = Math.Abs(entryRef - stopPrice) / tick;
+            if (double.IsNaN(stopDistanceTicks) || double.IsInfinity(stopDistanceTicks))
+                return UseCachedOrPlaceholder(ref cachedStopLabelText, "stop distance invalid");
+
+            if (stopDistanceTicks <= double.Epsilon)
+            {
+                cachedStopLabelText = "SL: BE";
+                return cachedStopLabelText;
+            }
+
+            double perContractRisk = (stopDistanceTicks * tickValue) + (CommissionMode == CommissionModeOption.On ? CommissionPerContractRoundTurn : 0);
+            // Use at least 1 contract for display risk to avoid showing $0 when qty is blocked.
+            double riskQty = Math.Max(1, GetDisplayQuantity());
+            double totalRisk = perContractRisk * riskQty;
             string distanceText = FormatPointsAndTicks(stopDistanceTicks);
             string label = $"SL: -{CurrencySymbol()}{totalRisk:F2} ({distanceText})";
             if (totalRisk > MaxRiskWarningUSD)
                 label = $"!! {label} !!";
+            cachedStopLabelText = label;
             return label;
         }
 
         private string GetTargetLabel()
         {
-            int qty = Math.Max(GetDisplayQuantity(), 0);
-            double entryRef = GetEntryReferenceForRisk();
-            double reward = Math.Abs(targetPrice - entryRef) / TickSize() * TickValue() * qty;
-            return $"TP: +{CurrencySymbol()}{reward:F2}";
+            if (!TryComputeSizing(out double tick, out double tickValue, out double entryRef, out string reason))
+                return UseCachedOrPlaceholder(ref cachedTargetLabelText, reason);
+
+            double rewardTicks = Math.Abs(targetPrice - entryRef) / tick;
+            if (double.IsNaN(rewardTicks) || double.IsInfinity(rewardTicks))
+                return UseCachedOrPlaceholder(ref cachedTargetLabelText, "reward distance invalid");
+
+            double rewardQty = Math.Max(1, GetDisplayQuantity());
+            double reward = rewardTicks * tickValue * rewardQty;
+            string label = $"TP: +{CurrencySymbol()}{reward:F2}";
+            cachedTargetLabelText = label;
+            return label;
         }
 
         private string GetRiskRewardText()
         {
-            double entryRef = GetEntryReferenceForRisk();
-            double stopTicks = GetStopDistanceTicks(entryRef);
-            if (stopTicks <= double.Epsilon)
-                return "R—";
+            if (!TryComputeSizing(out double tick, out _, out double entryRef, out string reason))
+                return UseCachedOrPlaceholder(ref cachedRrLabelText, reason);
 
-            double rewardTicks = Math.Abs(targetPrice - entryRef) / TickSize();
+            double stopTicks = Math.Abs(entryRef - stopPrice) / tick;
+            double rewardTicks = Math.Abs(targetPrice - entryRef) / tick;
+            if (stopTicks <= double.Epsilon || double.IsNaN(stopTicks) || double.IsInfinity(stopTicks))
+                return UseCachedOrPlaceholder(ref cachedRrLabelText, "stop ticks invalid");
+
             double rr = rewardTicks / stopTicks;
+            string rrText;
             if (Math.Abs(rr - 1.0) < 0.005)
-                return "R1";
-            return $"R{rr:F2}";
+                rrText = "R1";
+            else
+                rrText = $"R{rr:F2}";
+
+            cachedRrLabelText = rrText;
+            return rrText;
         }
 
         private double GetStopDistanceTicks(double entryRef)
         {
-            return Math.Abs(entryRef - stopPrice) / TickSize();
+            double tick = TickSize();
+            if (tick <= 0 || double.IsNaN(entryRef) || double.IsInfinity(entryRef))
+                return double.NaN;
+            return Math.Abs(entryRef - stopPrice) / tick;
+        }
+
+        private bool TryComputeSizing(out double tick, out double tickValue, out double entryRef, out string reason)
+        {
+            tick = TickSize();
+            tickValue = TickValue();
+            entryRef = double.NaN;
+
+            if (Instrument == null || Instrument.MasterInstrument == null)
+            {
+                reason = "instrument missing";
+                return false;
+            }
+            if (tick <= 0 || double.IsNaN(tick) || double.IsInfinity(tick))
+            {
+                reason = "TickSize<=0";
+                return false;
+            }
+            if (tickValue <= 0 || double.IsNaN(tickValue) || double.IsInfinity(tickValue))
+            {
+                reason = "TickValue<=0";
+                return false;
+            }
+
+            entryRef = GetEntryReferenceForRisk();
+            if (double.IsNaN(entryRef) || double.IsInfinity(entryRef) || entryRef <= 0)
+            {
+                reason = "entryRef invalid";
+                return false;
+            }
+
+            reason = null;
+            return true;
+        }
+
+        private string UseCachedOrPlaceholder(ref string cache, string reason)
+        {
+            if (ShouldLogLabelSkip())
+                LogDebug($"Label update skipped: {reason}");
+            if (!string.IsNullOrEmpty(cache))
+                return cache;
+            return "CALC…";
         }
 
         private string FormatPointsAndTicks(double stopDistanceTicks)
         {
             // Append stop distance as points.ticks (e.g., 20.3 where .3 = ticks past whole point)
-            double stopPoints = stopDistanceTicks * TickSize();
+            double tick = TickSize();
+            if (tick <= 0 || double.IsNaN(stopDistanceTicks) || double.IsInfinity(stopDistanceTicks))
+                return "CALC…";
+
+            double stopPoints = stopDistanceTicks * tick;
             double wholePoints = Math.Floor(stopPoints + 1e-9);
-            int ticksPerPoint = Math.Max(1, (int)Math.Round(1.0 / TickSize()));
-            int remainingTicks = (int)Math.Round((stopPoints - wholePoints) / TickSize());
+            int ticksPerPoint = Math.Max(1, (int)Math.Round(1.0 / tick));
+            int remainingTicks = (int)Math.Round((stopPoints - wholePoints) / tick);
             remainingTicks = Math.Max(0, Math.Min(remainingTicks, ticksPerPoint - 1));
             if (remainingTicks >= ticksPerPoint)
             {
@@ -1255,6 +1367,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             lastEntryLabel = null;
             lastStopLabel = null;
             lastTargetLabel = null;
+            cachedEntryLabelText = null;
+            cachedStopLabelText = null;
+            cachedTargetLabelText = null;
+            cachedQtyLabelText = null;
+            cachedRrLabelText = null;
             suppressLineEvents = false;
         }
 
@@ -1438,6 +1555,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             if ((DateTime.Now - lastDebugLogTime).TotalSeconds < 1)
                 return false;
             lastDebugLogTime = DateTime.Now;
+            return true;
+        }
+
+        private bool ShouldLogLabelSkip()
+        {
+            if ((DateTime.Now - lastLabelSkipLogTime).TotalSeconds < 1)
+                return false;
+            lastLabelSkipLogTime = DateTime.Now;
             return true;
         }
 
