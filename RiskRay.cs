@@ -65,6 +65,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Button sellButton;
         private Button closeButton;
         private Button beButton;
+        private Button trailButton;
         private DispatcherTimer blinkTimer;
         private bool blinkOn;
 
@@ -179,6 +180,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "BE Plus Ticks", Order = 15, GroupName = "RiskRay")]
         public int BreakEvenPlusTicks { get; set; }
 
+        [Range(1, int.MaxValue), NinjaScriptProperty]
+        [Display(Name = "TrailOffsetTicks", Order = 16, GroupName = "Trade Management")]
+        public int TrailOffsetTicks { get; set; }
+
         #endregion
 
         protected override void OnStateChange()
@@ -211,6 +216,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 LabelBarsRightOffset = 25;
                 LabelHorizontalShift = 0;
                 BreakEvenPlusTicks = 0;
+                TrailOffsetTicks = 20;
             }
             else if (State == State.Configure)
             {
@@ -401,20 +407,24 @@ namespace NinjaTrader.NinjaScript.Strategies
                     uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                     uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                     uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                    uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
                     buyButton = CreateButton("BUY", Brushes.DarkGreen, OnBuyClicked);
                     sellButton = CreateButton("SELL", Brushes.DarkRed, OnSellClicked);
                     closeButton = CreateButton("CLOSE", Brushes.DimGray, OnCloseClicked);
                     beButton = CreateButton("BE", Brushes.DarkSlateBlue, OnBeClicked);
+                    trailButton = CreateButton("TRAIL", Brushes.DarkOrange, OnTrailClicked);
 
                     uiRoot.Children.Add(buyButton);
                     uiRoot.Children.Add(sellButton);
                     uiRoot.Children.Add(closeButton);
                     uiRoot.Children.Add(beButton);
+                    uiRoot.Children.Add(trailButton);
                     Grid.SetColumn(buyButton, 0);
                     Grid.SetColumn(sellButton, 1);
                     Grid.SetColumn(closeButton, 2);
                     Grid.SetColumn(beButton, 3);
+                    Grid.SetColumn(trailButton, 4);
 
                     chartGrid.Children.Add(uiRoot);
                     uiLoaded = true;
@@ -460,12 +470,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     closeButton.Click -= OnCloseClicked;
                 if (beButton != null)
                     beButton.Click -= OnBeClicked;
+                if (trailButton != null)
+                    trailButton.Click -= OnTrailClicked;
 
                 uiRoot = null;
                 buyButton = null;
                 sellButton = null;
                 closeButton = null;
                 beButton = null;
+                trailButton = null;
                 uiLoaded = false;
             });
         }
@@ -485,6 +498,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     closeButton.IsEnabled = isArmed || Position.MarketPosition != MarketPosition.Flat || entryOrder != null;
                     closeButton.IsHitTestVisible = true;
+                }
+                if (trailButton != null)
+                {
+                    trailButton.IsEnabled = Position.MarketPosition != MarketPosition.Flat && stopOrder != null;
+                    trailButton.IsHitTestVisible = true;
                 }
                 if (beButton != null)
                     beButton.IsEnabled = Position.MarketPosition != MarketPosition.Flat && stopOrder != null;
@@ -582,6 +600,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void OnBeClicked(object sender, RoutedEventArgs e)
         {
             SafeExecute("OnBeClicked", MoveStopToBreakEven);
+        }
+
+        private void OnTrailClicked(object sender, RoutedEventArgs e)
+        {
+            SafeExecute("OnTrailClicked", ExecuteTrailStop);
         }
 
         #endregion
@@ -915,6 +938,48 @@ namespace NinjaTrader.NinjaScript.Strategies
             else
             {
                 LogInfo("BE failed: no working stop order");
+            }
+
+            ApplyLineUpdates();
+            UpdateLabelsOnly();
+        }
+
+        private void ExecuteTrailStop()
+        {
+            if (Position.MarketPosition == MarketPosition.Flat)
+            {
+                ShowTrailMessage("TRAIL: No open position.");
+                return;
+            }
+
+            if (!IsOrderActive(stopOrder))
+            {
+                ShowTrailMessage("TRAIL: Stop-loss order not found.");
+                return;
+            }
+
+            double refPrice = Position.MarketPosition == MarketPosition.Long ? GetCurrentBid() : GetCurrentAsk();
+            if (refPrice <= 0)
+                refPrice = Close[0];
+
+            double newStop = Position.MarketPosition == MarketPosition.Long
+                ? refPrice - TrailOffsetTicks * TickSize()
+                : refPrice + TrailOffsetTicks * TickSize();
+
+            newStop = RoundToTick(newStop);
+            stopPrice = newStop;
+            SetLinePrice(stopLine, stopPrice);
+            stopLineDirty = false;
+
+            if (IsOrderActive(stopOrder))
+            {
+                SafeExecute("ChangeOrder-TRAIL", () => ChangeOrder(stopOrder, stopOrder.Quantity, stopOrder.LimitPrice, stopPrice));
+                LogInfo($"TRAIL pressed: move SL to {stopPrice:F2} (offset {TrailOffsetTicks} ticks from {refPrice:F2})");
+            }
+            else
+            {
+                ShowTrailMessage("TRAIL: Stop-loss order not found.");
+                return;
             }
 
             ApplyLineUpdates();
@@ -1493,6 +1558,20 @@ namespace NinjaTrader.NinjaScript.Strategies
             fatalError = true;
             fatalErrorMessage = $"{context}: {ex.Message} | {ex.StackTrace}";
             Print($"[RiskRay][FATAL] {fatalErrorMessage}");
+        }
+
+        private void ShowTrailMessage(string message)
+        {
+            if (ChartControl == null)
+            {
+                Print($"[RiskRay] {message}");
+                return;
+            }
+
+            ChartControl.Dispatcher.InvokeAsync(() =>
+            {
+                MessageBox.Show(message, "RiskRay - Trail", MessageBoxButton.OK, MessageBoxImage.Information);
+            });
         }
 
         private void ShowBeBlockedDialog()
