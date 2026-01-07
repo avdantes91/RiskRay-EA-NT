@@ -552,7 +552,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void OnCloseClicked(object sender, RoutedEventArgs e)
         {
-            SafeExecute("OnCloseClicked", ClosePositionAndOrders);
+            try
+            {
+                Print("[RiskRay] CLOSE click received");
+                ResetAndFlatten("UserClose");
+            }
+            catch (Exception ex)
+            {
+                Print("[RiskRay] CLOSE exception: " + ex);
+            }
         }
 
         private void OnBeClicked(object sender, RoutedEventArgs e)
@@ -819,15 +827,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             UpdateLabelsOnly();
         }
 
-        private void ClosePositionAndOrders()
+        private void ResetAndFlatten(string reason)
         {
-            // If only armed (no position/orders), just disarm and clear visuals.
-            if (isArmed && Position.MarketPosition == MarketPosition.Flat && entryOrder == null)
-            {
-                DisarmAndClearLines();
-                LogInfo("CLOSE pressed: disarm ARMED state and clear lines");
-                return;
-            }
+            LogInfo("CLOSE pressed -> cancel orders + flatten + UI reset");
+
+            CancelActiveOrder(entryOrder, "CancelEntry");
+            CancelActiveOrder(stopOrder, "CancelStop");
+            CancelActiveOrder(targetOrder, "CancelTarget");
 
             if (Position.MarketPosition != MarketPosition.Flat)
             {
@@ -839,16 +845,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            if (IsOrderActive(entryOrder))
-                CancelOrder(entryOrder);
-            if (IsOrderActive(stopOrder))
-                CancelOrder(stopOrder);
-            if (IsOrderActive(targetOrder))
-                CancelOrder(targetOrder);
-
-            Disarm();
+            Disarm(true);
             RemoveAllDrawObjects();
-            LogInfo("CLOSE pressed: flatten + cancel working orders");
+
+            entryOrder = null;
+            stopOrder = null;
+            targetOrder = null;
+            currentOco = null;
+            hasPendingEntry = false;
+            avgEntryPrice = 0;
         }
 
         private void MoveStopToBreakEven()
@@ -1405,6 +1410,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             return order.OrderState != OrderState.Filled
                 && order.OrderState != OrderState.Cancelled
                 && order.OrderState != OrderState.Rejected;
+        }
+
+        private void CancelActiveOrder(Order order, string context)
+        {
+            if (!IsOrderActive(order))
+                return;
+
+            SafeExecute(context, () => CancelOrder(order));
         }
 
         private int GetDisplayQuantity()
