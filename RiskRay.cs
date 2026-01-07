@@ -117,6 +117,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lastLabelSkipLogTime = DateTime.MinValue;
         private bool isBeDialogOpen;
         private DateTime lastBeDialogTime = DateTime.MinValue;
+        private bool blinkBuy;
+        private bool blinkSell;
 
         #region Properties
 
@@ -491,9 +493,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             ChartControl.Dispatcher.InvokeAsync(() =>
             {
                 if (buyButton != null)
-                    buyButton.Opacity = (armedDirection == ArmDirection.Long && isArmed) ? (blinkOn ? 1 : 0.55) : 1;
+                    buyButton.Opacity = blinkBuy ? (blinkOn ? 1 : 0.55) : 1;
                 if (sellButton != null)
-                    sellButton.Opacity = (armedDirection == ArmDirection.Short && isArmed) ? (blinkOn ? 1 : 0.55) : 1;
+                    sellButton.Opacity = blinkSell ? (blinkOn ? 1 : 0.55) : 1;
                 if (closeButton != null)
                 {
                     closeButton.IsEnabled = isArmed || Position.MarketPosition != MarketPosition.Flat || entryOrder != null;
@@ -518,10 +520,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             ChartControl.Dispatcher.InvokeAsync(() =>
             {
+                blinkBuy = isArmed && armedDirection == ArmDirection.Long;
+                blinkSell = isArmed && armedDirection == ArmDirection.Short;
                 if (buyButton != null)
                     buyButton.Content = (isArmed && armedDirection == ArmDirection.Long) ? "BUY ARMED" : "BUY";
                 if (sellButton != null)
                     sellButton.Content = (isArmed && armedDirection == ArmDirection.Short) ? "SELL ARMED" : "SELL";
+                if (buyButton != null)
+                    buyButton.Opacity = blinkBuy ? (blinkOn ? 1 : 0.55) : 1;
+                if (sellButton != null)
+                    sellButton.Opacity = blinkSell ? (blinkOn ? 1 : 0.55) : 1;
             });
         }
 
