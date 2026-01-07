@@ -1,4 +1,14 @@
+# Local backups
+Záloha/
+Zaloha/
 
 # Specs / assignment (local)
 Zadání.txt
 Zadani.txt
+
+# Build / IDE
+bin/
+obj/
+.vs/
+*.user
+*.suo
