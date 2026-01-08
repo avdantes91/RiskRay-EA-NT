@@ -1,13 +1,7 @@
 // RiskRay strategy
-// README / Assumptions (max 8 bullets)
-// - Semi-manual trade planner/executor with BUY/SELL arming flow and bracketed exits.
-// - Chart WPF panel (BUY/SELL/CLOSE/BE) with blinking armed state; unmanaged OCO orders.
-// - Entry line follows bid/ask while armed; SL/TP draggable with ChangeOrder updates.
-// - Market-relative validity clamps lines to safe ticks to avoid instant triggers.
-// - Live sizing uses instrument tick/point metadata, half-up rounding, and MaxContracts cap.
-// - Break-even button moves stop to avg fill + offset ticks with market-relative clamp.
-// - Full cleanup on termination: timers, UI, handlers, draw objects.
-// - Single concurrent position per instrument; new arming blocked while non-flat/working.
+// Manual in-chart button panel drives unmanaged bracket orders through ARMED/CONFIRM actions (BUY/SELL/BE/TRAIL/CLOSE).
+// Constraints: strictly user-driven (no automation), single position per instrument, market replay friendly, unmanaged order model only.
+// Components: WPF panel with blink feedback, risk-based sizing, draggable entry/SL/TP lines with clamps, unmanaged submission/tracking, and BE/TRAIL/CLOSE flows.
 
 using System;
 using System.Collections.Generic;
@@ -30,6 +24,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 {
     public class RiskRay : Strategy
     {
+        #region Fields / State
+
+        // Arming state used for the two-step confirmation flow.
         private enum ArmDirection
         {
             None,
@@ -37,6 +34,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Short
         }
 
+        // Commission/logging options exposed via user parameters.
         public enum CommissionModeOption
         {
             Off,
@@ -50,6 +48,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Debug
         }
 
+        // WPF panel controls for manual interaction and blink feedback.
         private Grid uiRoot;
         private Button buyButton;
         private Button sellButton;
@@ -59,32 +58,39 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DispatcherTimer blinkTimer;
         private bool blinkOn;
 
+        // ARMED state flags that gate line movement and order submission.
         private ArmDirection armedDirection = ArmDirection.None;
         private bool isArmed;
         private bool hasPendingEntry;
 
+        // Draw objects that mirror current entry/stop/target intentions.
         private HorizontalLine entryLine;
         private HorizontalLine stopLine;
         private HorizontalLine targetLine;
 
+        // Tracked prices for sizing and HUD labels.
         private double entryPrice;
         private double stopPrice;
         private double targetPrice;
         private double avgEntryPrice;
 
+        // Unmanaged order handles and OCO group identifier (OrderTagPrefix invariant).
         private Order entryOrder;
         private Order stopOrder;
         private Order targetOrder;
         private string currentOco;
 
+        // Per-event throttles to avoid noisy logs while dragging/clamping/sizing.
         private DateTime lastClampLogTime = DateTime.MinValue;
         private DateTime lastDebugLogTime = DateTime.MinValue;
         private DateTime lastQtyBlockLogTime = DateTime.MinValue;
 
+        // Chart attachment state and suppression flags used while programmatically moving lines.
         private bool suppressLineEvents;
         private bool uiLoaded;
         private Grid chartGrid;
 
+        // Cached draw objects/labels to prevent leakage and redundant re-renders.
         private readonly List<DrawingTool> trackedDrawObjects = new List<DrawingTool>();
         private bool entryLineDirty;
         private bool stopLineDirty;
@@ -105,6 +111,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string cachedQtyLabelText;
         private string cachedRrLabelText;
         private DateTime lastLabelSkipLogTime = DateTime.MinValue;
+        // Dialog/blink/self-check guards that throttle popups and enforce safety invariants.
         private bool isBeDialogOpen;
         private DateTime lastBeDialogTime = DateTime.MinValue;
         private bool blinkBuy;
@@ -115,7 +122,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool selfCheckDialogShown;
         private int blinkTickCounter;
 
+        #endregion
+
+        #region Inputs / Parameters
+
         #region Properties
+        // User-configurable inputs for risk sizing, default offsets, logging, and ID tagging (assumed static during run).
 
         [Range(1, double.MaxValue), NinjaScriptProperty]
         [Display(Name = "FixedRiskUSD", Order = 1, GroupName = "Parameters")]
@@ -190,7 +202,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         public string OrderTagPrefix { get; set; }
 
         #endregion
+        #endregion
 
+        #region Lifecycle
+
+        // Lifecycle gate: builds UI in historical for chart availability, runs self-check once in realtime, and cleans up unmanaged artifacts on termination.
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
@@ -253,6 +269,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // Main tick handler in realtime: keeps entry line following bid/ask while armed and refreshes HUD without changing user-placed stops/targets.
         protected override void OnBarUpdate()
         {
             try
@@ -271,6 +288,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // Responds to market data for smoother drag/line updates (especially in playback), keeping stops/targets in sync while respecting clamps.
         protected override void OnMarketData(MarketDataEventArgs marketDataUpdate)
         {
             try
@@ -290,6 +308,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // Tracks unmanaged orders, fills, and rejects; updates local handles and resets ARMED state on entry fills.
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPriceParam, int quantity, int filled, double averageFillPrice, OrderState orderState, DateTime time, ErrorCode error, string nativeError)
         {
             try
@@ -343,6 +362,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // Mirrors execution-level fills into avgEntryPrice and exit handling for unmanaged flow.
         protected override void OnExecutionUpdate(Execution execution, string executionId, double price, int quantity, MarketPosition marketPosition, string orderId, DateTime time)
         {
             try
@@ -362,6 +382,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // When flat, fully reset local state and draw objects to match broker position.
         protected override void OnPositionUpdate(Position position, double averagePrice, int quantity, MarketPosition marketPosition)
         {
             try
@@ -389,8 +410,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        #endregion
+
+        #region UI Panel
+
         #region UI
 
+        // Create the WPF chart-side button panel once ChartControl is available; must marshal to dispatcher to satisfy NinjaTrader UI thread rules.
         private void BuildUi()
         {
             if (ChartControl == null || uiLoaded)
@@ -446,6 +472,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             });
         }
 
+        // Factory for consistent button styling and click hookup for the manual control panel.
         private Button CreateButton(string content, Brush baseBrush, RoutedEventHandler handler)
         {
             var button = new Button
@@ -463,6 +490,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return button;
         }
 
+        // Tear down the WPF panel and detach events on disposal or termination to avoid stale references.
         private void DisposeUi()
         {
             if (!uiLoaded || ChartControl == null)
@@ -495,6 +523,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             });
         }
 
+        // Dispatcher-safe UI refresh for opacity/enabled states based on ARMED and position status.
         private void UpdateUiState()
         {
             if (ChartControl == null || !uiLoaded)
@@ -525,6 +554,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             });
         }
 
+        // Keeps BUY/SELL button text and blink state aligned with ARMED direction.
         private void UpdateArmButtonsUI()
         {
             if (ChartControl == null || !uiLoaded)
@@ -547,6 +577,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             });
         }
 
+        // Blink timer (500ms) drives visual feedback for ARMED state; must run on chart dispatcher to avoid cross-thread WPF access.
         private void StartBlinkTimer()
         {
             if (blinkTimer != null)
@@ -586,6 +617,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             });
         }
 
+        // Stop and release blink timer when no longer needed.
         private void StopBlinkTimer()
         {
             if (blinkTimer == null)
@@ -600,6 +632,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         #region Buttons
 
+        // BUY uses ARMED -> CONFIRM: first click arms, second submits entry + bracket if flat and no pending entry.
         private void OnBuyClicked(object sender, RoutedEventArgs e)
         {
             LogInfo("UserClick: BUYARM");
@@ -622,6 +655,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             });
         }
 
+        // SELL mirrors BUY flow for shorts and blocks arming while any position or pending entry exists.
         private void OnSellClicked(object sender, RoutedEventArgs e)
         {
             LogInfo("UserClick: SELLARM");
@@ -644,6 +678,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             });
         }
 
+        // CLOSE cancels all working orders and flattens exposure regardless of ARMED state.
         private void OnCloseClicked(object sender, RoutedEventArgs e)
         {
             try
@@ -658,12 +693,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // BE shifts stop to break-even (+offset) only when trade is in profit; otherwise shows throttled dialog.
         private void OnBeClicked(object sender, RoutedEventArgs e)
         {
             LogInfo("UserClick: BE");
             SafeExecute("OnBeClicked", MoveStopToBreakEven);
         }
 
+        // TRAIL repositions the stop relative to current market using configured offset when a working stop exists.
         private void OnTrailClicked(object sender, RoutedEventArgs e)
         {
             LogInfo("UserClick: TRAIL");
@@ -671,9 +708,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         #endregion
+        #endregion
+
+        #region Lines/Draw Objects
 
         #region Arming and lines
 
+        // Enter ARMED state and initialize lines around bid/ask; blink toggles to indicate pending confirm step.
         private void Arm(ArmDirection direction)
         {
             armedDirection = direction;
@@ -694,6 +735,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             LogInfo($"{direction} ARMED");
         }
 
+        // Reset ARMED flags and optionally clear draw objects; used after fills/errors to stop auto-updating entry line.
         private void Disarm(bool removeLines = true)
         {
             isArmed = false;
@@ -711,6 +753,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             UpdateUiState();
         }
 
+        // Hard reset of arming and tracked prices; used on CLOSE flow to clear HUD artifacts.
         private void DisarmAndClearLines()
         {
             isArmed = false;
@@ -726,6 +769,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             UpdateUiState();
         }
 
+        // Seeds entry/SL/TP lines from current bid/ask with default offsets; applies clamps to stay off-market before confirmation.
         private void InitializeLinesForDirection(ArmDirection direction)
         {
             double refPrice = GetEntryReference(direction);
@@ -747,6 +791,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 LogClampOnce("Default lines clamped to stay off-market");
         }
 
+        // Entry line follows live bid/ask while ARMED so user always confirms at current market-relative level.
         private void UpdateEntryLineFromMarket()
         {
             if (!isArmed || armedDirection == ArmDirection.None)
@@ -761,6 +806,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // Detect user drags on stop/target lines, clamp to valid prices, and push ChangeOrder when live orders exist.
         private void ProcessLineDrag(HorizontalLine line, ref double trackedPrice, bool isStop)
         {
             if (line == null || suppressLineEvents)
@@ -827,12 +873,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             UpdateLabelsOnly();
         }
 
+        // Snap entry price to tick and mirror HUD label; used on fills and ARMED updates.
         private void UpdateEntryLine(double price, string reason)
         {
             entryPrice = RoundToTick(price);
             CreateOrUpdateEntryLine(entryPrice, $"{GetQtyLabel()} ({reason})");
         }
 
+        // Create/update entry line + label while suppressing drag callbacks.
         private void CreateOrUpdateEntryLine(double price, string label)
         {
             suppressLineEvents = true;
@@ -854,6 +902,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             suppressLineEvents = false;
         }
 
+        // Create/update stop line; remains draggable so ChangeOrder can pick up user edits.
         private void CreateOrUpdateStopLine(double price, string label)
         {
             suppressLineEvents = true;
@@ -875,6 +924,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             suppressLineEvents = false;
         }
 
+        // Create/update target line with unlocked drag behavior for user adjustments.
         private void CreateOrUpdateTargetLine(double price, string label)
         {
             suppressLineEvents = true;
@@ -897,9 +947,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         #endregion
+        #endregion
+
+        #region Order Management
 
         #region Orders
 
+        // CONFIRM step: clamps lines against market, computes quantity, and submits unmanaged entry + OCO stop/target with tag prefix (INVARIANT: self-check must pass and qty>=1).
         private void ConfirmEntry()
         {
             if (!isArmed || armedDirection == ArmDirection.None)
@@ -946,6 +1000,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             UpdateLabelsOnly();
         }
 
+        // CLOSE flow: cancels working entry/exit orders, flattens position, and clears HUD/arming state.
         private void ResetAndFlatten(string reason)
         {
             LogInfo("CLOSE pressed -> cancel orders + flatten + UI reset");
@@ -975,6 +1030,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             avgEntryPrice = 0;
         }
 
+        // Break-even helper: blocks when not profitable and clamps stop/target to avoid invalid placement.
         private void MoveStopToBreakEven()
         {
             if (Position.MarketPosition == MarketPosition.Flat || stopOrder == null)
@@ -1027,6 +1083,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             UpdateLabelsOnly();
         }
 
+        // Trail helper: moves stop relative to current bid/ask using configured offset; errors displayed via message box.
         private void ExecuteTrailStop()
         {
             if (Position.MarketPosition == MarketPosition.Flat)
@@ -1072,6 +1129,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             UpdateLabelsOnly();
         }
 
+        // Clears order references/UI when a stop or target fill flattens the position.
         private void HandlePositionClosed(string reason)
         {
             LogInfo($"Exit filled via {reason}");
@@ -1083,6 +1141,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Disarm();
         }
 
+        // Cleanup path for rejected/cancelled orders to avoid lingering ARMED state or draw objects.
         private void CleanupAfterError()
         {
             if (IsOrderActive(entryOrder))
@@ -1096,9 +1155,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         #endregion
+        #endregion
 
-        #region Helpers
+        #region Helpers / Utilities
 
+        // Tag helpers keep unmanaged orders/draw objects grouped under the configured prefix (invariant: all tags start with OrderTagPrefix).
         private string Tag(string suffix)
         {
             return $"{OrderTagPrefix}{suffix}";
@@ -1119,6 +1180,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string BeSignal => Tag("BE");
         private string TrailSignal => Tag("TRAIL");
 
+        // Resolve working direction for sizing and label offset when either armed or already in a position.
         private MarketPosition GetWorkingDirection()
         {
             if (Position.MarketPosition != MarketPosition.Flat)
@@ -1131,6 +1193,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return MarketPosition.Flat;
         }
 
+        // Safe accessor for draggable line anchor prices.
         private double? GetLinePrice(HorizontalLine line)
         {
             if (line == null || line.StartAnchor == null)
@@ -1138,6 +1201,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return line.StartAnchor.Price;
         }
 
+        // Entry reference defaults to last close unless configured to follow bid/ask for tighter arming.
         private double GetEntryReference(ArmDirection direction)
         {
             double last = Close[0];
@@ -1152,6 +1216,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             return bid > 0 ? bid : last;
         }
 
+        #region Risk & Sizing
+
+        // Tick metadata helpers used by all sizing math.
         private double TickSize()
         {
             return Instrument != null && Instrument.MasterInstrument != null
@@ -1169,6 +1236,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return Instrument.MasterInstrument.RoundToTickSize(price);
         }
 
+        // Entry reference for risk sizing prefers live average price, otherwise current ARMED entry tracking.
         private double GetEntryReferenceForRisk()
         {
             if (Position != null && Position.MarketPosition != MarketPosition.Flat && Position.Quantity != 0)
@@ -1180,6 +1248,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return entryPrice;
         }
 
+        // Risk-per-trade sizing: half-up rounding with MaxContracts cap; returns 0 when distance invalid.
         private int CalculateQuantity()
         {
             double tick = TickSize();
@@ -1197,6 +1266,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             return qty;
         }
 
+        #region HUD
+
+        // Apply pending line updates guarded by dirty flags to avoid overriding user drags or redrawing every tick.
         private void ApplyLineUpdates()
         {
             // Only move lines when their tracked price changed; avoids ticking redraws that used to override user drags.
@@ -1219,6 +1291,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // Refresh label text/caches only (no line moves) and throttle debug output to once per second.
         private void UpdateLabelsOnly()
         {
             if (!HasActiveLines())
@@ -1255,6 +1328,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // Entry label merges qty + RR, falling back to cached text when sizing temporarily unavailable.
         private string GetEntryLabelSafe()
         {
             string qtyLabel = GetQtyLabel();
@@ -1271,6 +1345,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return combined;
         }
 
+        // Computes display quantity text using cached placeholder when sizing inputs invalid.
         private string GetQtyLabel()
         {
             if (!TryComputeSizing(out double tick, out double tickValue, out double entryRef, out string reason))
@@ -1294,6 +1369,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return label;
         }
 
+        // Stop label displays currency risk and distance; warns when over MaxRiskWarningUSD threshold.
         private string GetStopLabel()
         {
             if (!TryComputeSizing(out double tick, out double tickValue, out double entryRef, out string reason))
@@ -1321,6 +1397,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return label;
         }
 
+        // Target label shows reward estimate; reused cached placeholder if sizing unavailable.
         private string GetTargetLabel()
         {
             if (!TryComputeSizing(out double tick, out double tickValue, out double entryRef, out string reason))
@@ -1340,6 +1417,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return label;
         }
 
+        // Computes R multiple for HUD; caches last known value if sizing inputs invalid.
         private string GetRiskRewardText()
         {
             if (!TryComputeSizing(out double tick, out _, out double entryRef, out string reason))
@@ -1361,6 +1439,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return rrText;
         }
 
+        // Utility to compute stop distance in ticks for sizing; returns NaN when instrument info missing.
         private double GetStopDistanceTicks(double entryRef)
         {
             double tick = TickSize();
@@ -1369,6 +1448,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return Math.Abs(entryRef - stopPrice) / tick;
         }
 
+        // Validates tick metadata + entry reference before sizing; prevents downstream NaNs and blocks orders when invalid.
         private bool TryComputeSizing(out double tick, out double tickValue, out double entryRef, out string reason)
         {
             tick = TickSize();
@@ -1402,6 +1482,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return true;
         }
 
+        // Uses cached HUD text or placeholder while logging skips throttled to avoid spam.
         private string UseCachedOrPlaceholder(ref string cache, string reason)
         {
             if (ShouldLogLabelSkip())
@@ -1411,6 +1492,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return "CALC…";
         }
 
+        // Converts tick distance into points.ticks format for concise HUD display.
         private string FormatPointsAndTicks(double stopDistanceTicks)
         {
             // Append stop distance as points.ticks (e.g., 20.3 where .3 = ticks past whole point)
@@ -1431,6 +1513,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return $"{wholePoints}.{remainingTicks}";
         }
 
+        // Places labels a set distance to the right while clamping to sane bounds for visibility.
         private int GetLabelBarsAgo()
         {
             int baseBarsRight = Math.Max(0, LabelBarsRightOffset);
@@ -1440,6 +1523,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return barsAgo;
         }
 
+        // Draws or updates text labels with directional offsets; assumes dispatcher-safe context.
         private void CreateOrUpdateLabel(string tag, double price, string text, Brush brush)
         {
             // Offset in ticks, scaled up using pixel preference (fallback tick-based approach for NT8 compatibility).
@@ -1462,6 +1546,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TrackDrawObject(label);
         }
 
+        #endregion
+
+        #endregion
+
+        #region Lines/Draw Objects (helpers)
+
+        // Update helper: set both anchors while suppressing drag events.
         private void SetLinePrice(HorizontalLine line, double price)
         {
             if (line == null)
@@ -1474,6 +1565,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             suppressLineEvents = false;
         }
 
+        // Clamp stop/target to stay one tick off current bid/ask; protects unmanaged orders from instantly triggering.
         private void EnforceValidity(MarketPosition direction, ref double stop, ref double target, out bool clamped)
         {
             clamped = false;
@@ -1517,6 +1609,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // Remove all strategy-owned draw objects and reset caches; used on disarm and cleanup.
         private void RemoveAllDrawObjects()
         {
             suppressLineEvents = true;
@@ -1549,6 +1642,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             suppressLineEvents = false;
         }
 
+        // Track draw objects to avoid duplicates and simplify cleanup.
         private void TrackDrawObject(DrawingTool obj)
         {
             if (obj == null)
@@ -1558,6 +1652,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             trackedDrawObjects.Add(obj);
         }
 
+        #endregion
+
+        #region Logging & Diagnostics
+
+        // Level-gated info logger for user actions and state transitions.
         private void LogInfo(string message)
         {
             if (LogLevelSetting == LogLevelOption.Off)
@@ -1565,6 +1664,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Print($"[RiskRay][{OrderTagPrefix}] {message}");
         }
 
+        // Clamp logs are throttled to once per second to avoid spam while dragging near market.
         private void LogClampOnce(string message)
         {
             if (LogLevelSetting == LogLevelOption.Off)
@@ -1575,6 +1675,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Print($"[RiskRay][{OrderTagPrefix}] {message}");
         }
 
+        // Logs when qty calculation would be <1; throttled to avoid repeat noise.
         private void LogQtyBlocked()
         {
             if (LogLevelSetting == LogLevelOption.Off)
@@ -1585,6 +1686,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Print($"[RiskRay][{OrderTagPrefix}] Qty < 1 => block confirmation");
         }
 
+        // Wrapper to centralize fatal logging while preserving original context.
         private void SafeExecute(string context, Action action)
         {
             try
@@ -1597,6 +1699,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // Hook chart mouse-up to finalize drag operations (UI thread).
         private void AttachChartEvents()
         {
             if (chartEventsAttached || ChartControl == null)
@@ -1606,6 +1709,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             chartEventsAttached = true;
         }
 
+        // Detach chart mouse-up when disposing UI to avoid leaks.
         private void DetachChartEvents()
         {
             if (!chartEventsAttached || ChartControl == null)
@@ -1620,6 +1724,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             SafeExecute("MouseUp", FinalizeDrag);
         }
 
+        // Finalizes drag: clamps prices, syncs ChangeOrder, and clears drag flags; ensures stops stay off-market.
         private void FinalizeDrag()
         {
             bool didLog = false;
@@ -1662,6 +1767,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             isDraggingTarget = false;
         }
 
+        // Marks fatal state and logs detailed exception for troubleshooting.
         private void LogFatal(string context, Exception ex)
         {
             fatalError = true;
@@ -1669,6 +1775,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Print($"[RiskRay][{OrderTagPrefix}][FATAL] {fatalErrorMessage}");
         }
 
+        // Trail user messaging; dispatcher used to satisfy WPF thread affinity.
         private void ShowTrailMessage(string message)
         {
             if (ChartControl == null)
@@ -1683,6 +1790,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             });
         }
 
+        // Break-even blocked dialog; throttled and dispatcher-bound to avoid repeated popups during flat/profit checks.
         private void ShowBeBlockedDialog()
         {
             // Throttle dialog to avoid spamming
@@ -1709,6 +1817,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             });
         }
 
+        // Drag debug output throttled to 200ms per side to stay readable.
         private void LogDebugDrag(string prefix, double price)
         {
             if (LogLevelSetting != LogLevelOption.Debug)
@@ -1731,6 +1840,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Print($"[RiskRay][{OrderTagPrefix}][DEBUG] {prefix} {price:F2}");
         }
 
+        // Debug logger gated by Debug level.
         private void LogDebug(string message)
         {
             if (LogLevelSetting != LogLevelOption.Debug)
@@ -1738,6 +1848,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Print($"[RiskRay][{OrderTagPrefix}][DEBUG] {message}");
         }
 
+        // Simple throttle to avoid chatty debug logs.
         private bool ShouldLogDebug()
         {
             if ((DateTime.Now - lastDebugLogTime).TotalSeconds < 1)
@@ -1746,6 +1857,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return true;
         }
 
+        // Validates instrument metadata once per session and blocks order actions when invalid.
         private void RunSelfCheckOnce()
         {
             if (selfCheckDone)
@@ -1780,6 +1892,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // Guard used before sensitive operations; shows dialog when self-check failed.
         private bool EnsureSelfCheckPassed()
         {
             if (!selfCheckFailed)
@@ -1789,6 +1902,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return false;
         }
 
+        // Throttled error dialog for self-check failures; orders remain blocked until resolved.
         private void ShowSelfCheckFailedDialog()
         {
             if (selfCheckDialogShown)
@@ -1807,6 +1921,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             });
         }
 
+        // Prevent label skip logs from spamming more than once per second.
         private bool ShouldLogLabelSkip()
         {
             if ((DateTime.Now - lastLabelSkipLogTime).TotalSeconds < 1)
@@ -1815,11 +1930,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             return true;
         }
 
+        #endregion
+
+        // Quick helper to see if HUD elements exist; used to skip unnecessary updates.
         private bool HasActiveLines()
         {
             return entryLine != null || stopLine != null || targetLine != null;
         }
 
+        // Human-readable state for logs; preserves fatal flag even when positions exist.
         private string DescribeState()
         {
             if (fatalError)
@@ -1835,6 +1954,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return "Idle";
         }
 
+        // Invariant helper: unmanaged order considered active unless filled/cancelled/rejected.
         private bool IsOrderActive(Order order)
         {
             if (order == null)
@@ -1845,6 +1965,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 && order.OrderState != OrderState.Rejected;
         }
 
+        // Cancel only when active; wraps in SafeExecute for consistent fatal handling.
         private void CancelActiveOrder(Order order, string context)
         {
             if (!IsOrderActive(order))
@@ -1853,6 +1974,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             SafeExecute(context, () => CancelOrder(order));
         }
 
+        // Display qty prefers live position or working entry qty; falls back to calculated size for HUD.
         private int GetDisplayQuantity()
         {
             if (Position.MarketPosition != MarketPosition.Flat && Position.Quantity != 0)
@@ -1864,6 +1986,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return CalculateQuantity();
         }
 
+        // Currency symbol helper for HUD labels; defaults to USD.
         private string CurrencySymbol()
         {
             Currency currency = Instrument?.MasterInstrument?.Currency ?? Currency.UsDollar;
