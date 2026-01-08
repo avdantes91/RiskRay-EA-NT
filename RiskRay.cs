@@ -1293,7 +1293,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             double rewardQty = Math.Max(1, GetDisplayQuantity());
             double reward = rewardTicks * tickValue * rewardQty;
-            string label = $"TP: +{CurrencySymbol()}{reward:F2}";
+            string ptsTicks = FormatPointsAndTicks(rewardTicks);
+            string label = $"TP: +{CurrencySymbol()}{reward:F2} ({ptsTicks})";
+            if (DebugBlink)
+                Print($"[RiskRay][DEBUG] TP label -> $={reward:F2}, targetTicks={rewardTicks:F1}, ptsTicks={ptsTicks}");
             cachedTargetLabelText = label;
             return label;
         }
