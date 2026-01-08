@@ -48,6 +48,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             Debug
         }
 
+        public enum LabelOffsetModeOption
+        {
+            Legacy_TicksMax,
+            TicksOnly,
+            ApproxPixels
+        }
+
+        public enum NotificationModeOption
+        {
+            MessageBox,
+            HUD
+        }
+
         // WPF panel controls for manual interaction and blink feedback.
         private Grid uiRoot;
         private Button buyButton;
@@ -56,6 +69,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Button beButton;
         private Button trailButton;
         private DispatcherTimer blinkTimer;
+        private EventHandler blinkTickHandler;
         private bool blinkOn;
 
         // ARMED state flags that gate line movement and order submission.
@@ -121,6 +135,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string selfCheckReason;
         private bool selfCheckDialogShown;
         private int blinkTickCounter;
+        private DateTime lastUiErrorLogTime = DateTime.MinValue;
+        private DateTime lastCleanupLogTime = DateTime.MinValue;
+        private bool receivedMarketDataThisSession;
+        private double cachedTickSize;
+        private string lastMilestone;
+        private DateTime lastMilestoneTime = DateTime.MinValue;
+        private int fatalCount;
+        private DateTime lastHudMessageTime = DateTime.MinValue;
 
         #endregion
 
@@ -201,6 +223,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "OrderTagPrefix", Order = 10, GroupName = "RiskRay - IDs")]
         public string OrderTagPrefix { get; set; }
 
+        [NinjaScriptProperty]
+        [Display(Name = "LabelOffsetMode", Description = "Legacy_TicksMax treats LabelOffsetPixels as tick-equivalent (current behavior).", Order = 11, GroupName = "Labels")]
+        public LabelOffsetModeOption LabelOffsetMode { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "NotificationMode", Description = "MessageBox (default) or HUD (non-blocking) for alerts.", Order = 18, GroupName = "Debug")]
+        public NotificationModeOption NotificationMode { get; set; }
+
         #endregion
         #endregion
 
@@ -244,28 +274,45 @@ namespace NinjaTrader.NinjaScript.Strategies
                 selfCheckDialogShown = false;
                 DebugBlink = false;
                 OrderTagPrefix = "RR_";
+                LabelOffsetMode = LabelOffsetModeOption.Legacy_TicksMax;
+                NotificationMode = NotificationModeOption.MessageBox;
+                receivedMarketDataThisSession = false;
+                cachedTickSize = 0;
+                lastMilestone = null;
+                lastMilestoneTime = DateTime.MinValue;
+                fatalCount = 0;
             }
             else if (State == State.Configure)
             {
             }
             else if (State == State.Historical)
             {
+                SetMilestone("Historical");
                 SafeExecute("BuildUi", BuildUi);
                 SafeExecute("AttachChartEvents", AttachChartEvents);
             }
             else if (State == State.Realtime)
             {
+                SetMilestone("Realtime");
                 RunSelfCheckOnce();
                 SafeExecute("StartBlinkTimer", StartBlinkTimer);
                 SafeExecute("AttachChartEvents", AttachChartEvents);
             }
             else if (State == State.Terminated)
             {
-                DetachChartEvents();
-                DisposeUi();
-                StopBlinkTimer();
-                RemoveAllDrawObjects();
-                Print($"[RiskRay][{OrderTagPrefix}] [State.Terminated] state={DescribeState()} fatal={fatalError} detail={fatalErrorMessage}");
+                SetMilestone("Terminated-Start");
+                try
+                {
+                    DetachChartEvents();
+                    StopBlinkTimer();
+                    DisposeUi(true);
+                    RemoveAllDrawObjects();
+                    Print($"[RiskRay][{OrderTagPrefix}] [State.Terminated] state={DescribeState()} fatal={fatalError} detail={fatalErrorMessage} milestone={lastMilestone} at={lastMilestoneTime:o} fatalCount={fatalCount}");
+                }
+                catch (Exception ex)
+                {
+                    LogFatal("OnStateChange.Terminated", ex);
+                }
             }
         }
 
@@ -275,6 +322,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             try
             {
                 if (State != State.Realtime)
+                    return;
+
+                // Fallback pulse when MarketData is unavailable; skips if realtime market data already observed.
+                if (receivedMarketDataThisSession)
                     return;
 
                 // Only entry line follows price while armed; stops/targets stay where user placed them.
@@ -295,6 +346,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (State != State.Realtime)
                     return;
+
+                receivedMarketDataThisSession = true;
 
                 UpdateEntryLineFromMarket();
                 ProcessLineDrag(stopLine, ref stopPrice, true);
@@ -422,7 +475,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (ChartControl == null || uiLoaded)
                 return;
 
-            ChartControl.Dispatcher.InvokeAsync(() =>
+            SetMilestone("BuildUi-Start");
+            UiBeginInvoke(() =>
             {
                 SafeExecute("BuildUi.Dispatcher", () =>
                 {
@@ -468,6 +522,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     uiLoaded = true;
                     UpdateUiState();
                     AttachChartEvents();
+                    SetMilestone("BuildUi-End");
                 });
             });
         }
@@ -491,16 +546,43 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // Tear down the WPF panel and detach events on disposal or termination to avoid stale references.
-        private void DisposeUi()
+        private void DisposeUi(bool forceSync = false)
         {
-            if (!uiLoaded || ChartControl == null)
+            if (!uiLoaded)
                 return;
 
-            ChartControl.Dispatcher.InvokeAsync(() =>
+            SetMilestone("DisposeUi-Start");
+            if (ChartControl == null || ChartControl.Dispatcher == null || ChartControl.Dispatcher.HasShutdownStarted)
+            {
+                // Fallback cleanup when dispatcher is gone; avoid touching UI elements.
+                buyButton = null;
+                sellButton = null;
+                closeButton = null;
+                beButton = null;
+                trailButton = null;
+                uiRoot = null;
+                chartGrid = null;
+                chartEventsAttached = false;
+                uiLoaded = false;
+                SetMilestone("DisposeUi-End");
+                return;
+            }
+
+            Action disposer = () =>
             {
                 DetachChartEvents();
-                if (uiRoot != null && chartGrid != null && chartGrid.Children.Contains(uiRoot))
-                    chartGrid.Children.Remove(uiRoot);
+                if (uiRoot != null && chartGrid != null)
+                {
+                    try
+                    {
+                        if (chartGrid.Children.Contains(uiRoot))
+                            chartGrid.Children.Remove(uiRoot);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogUiError("DisposeUi.Remove", ex);
+                    }
+                }
 
                 if (buyButton != null)
                     buyButton.Click -= OnBuyClicked;
@@ -520,7 +602,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 beButton = null;
                 trailButton = null;
                 uiLoaded = false;
-            });
+                LogInfo("UI disposed");
+                SetMilestone("DisposeUi-End");
+            };
+
+            if (forceSync)
+                UiInvoke(disposer);
+            else
+                UiBeginInvoke(disposer);
         }
 
         // Dispatcher-safe UI refresh for opacity/enabled states based on ARMED and position status.
@@ -529,7 +618,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (ChartControl == null || !uiLoaded)
                 return;
 
-            ChartControl.Dispatcher.InvokeAsync(() =>
+            UiBeginInvoke(() =>
             {
                 if (buyButton != null)
                     buyButton.Opacity = blinkBuy ? (blinkOn ? 1 : 0.55) : 1;
@@ -560,7 +649,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (ChartControl == null || !uiLoaded)
                 return;
 
-            ChartControl.Dispatcher.InvokeAsync(() =>
+            UiBeginInvoke(() =>
             {
                 blinkBuy = isArmed && armedDirection == ArmDirection.Long;
                 blinkSell = isArmed && armedDirection == ArmDirection.Short;
@@ -580,22 +669,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Blink timer (500ms) drives visual feedback for ARMED state; must run on chart dispatcher to avoid cross-thread WPF access.
         private void StartBlinkTimer()
         {
-            if (blinkTimer != null)
-                return;
-
-            if (ChartControl == null || ChartControl.Dispatcher == null)
-                return;
-
-            ChartControl.Dispatcher.InvokeAsync(() =>
+            UiInvoke(() =>
             {
-                if (blinkTimer != null)
+                if (blinkTimer != null || ChartControl == null || ChartControl.Dispatcher == null)
                     return;
 
+                SetMilestone("StartBlinkTimer");
                 blinkTimer = new DispatcherTimer(DispatcherPriority.Normal, ChartControl.Dispatcher)
                 {
                     Interval = TimeSpan.FromMilliseconds(500)
                 };
-                blinkTimer.Tick += (s, e) =>
+                blinkTickHandler = (s, e) =>
                 {
                     blinkTickCounter++;
                     SafeExecute("BlinkTimer", () =>
@@ -611,21 +695,45 @@ namespace NinjaTrader.NinjaScript.Strategies
                         UpdateUiState();
                     });
                 };
+                blinkTimer.Tick += blinkTickHandler;
                 blinkTimer.Start();
-                if (DebugBlink)
-                    Print("[RiskRay][DEBUG] Blink: start timer (500ms)");
+                LogInfo("Blink timer started");
             });
         }
 
         // Stop and release blink timer when no longer needed.
         private void StopBlinkTimer()
         {
-            if (blinkTimer == null)
+            if (blinkTimer != null && (ChartControl == null || ChartControl.Dispatcher == null || ChartControl.Dispatcher.HasShutdownStarted))
+            {
+                try
+                {
+                    if (blinkTickHandler != null)
+                        blinkTimer.Tick -= blinkTickHandler;
+                    blinkTimer.Stop();
+                }
+                catch (Exception ex)
+                {
+                    LogUiError("StopBlinkTimer", ex);
+                }
+                blinkTimer = null;
+                blinkTickHandler = null;
                 return;
+            }
 
-            blinkTimer.Stop();
-            blinkTimer.Tick -= null;
-            blinkTimer = null;
+            UiInvoke(() =>
+            {
+                if (blinkTimer == null)
+                    return;
+
+                if (blinkTickHandler != null)
+                    blinkTimer.Tick -= blinkTickHandler;
+                blinkTimer.Stop();
+                blinkTimer = null;
+                blinkTickHandler = null;
+                SetMilestone("StopBlinkTimer");
+                LogInfo("Blink timer stopped");
+            });
         }
 
         #endregion
@@ -883,67 +991,88 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Create/update entry line + label while suppressing drag callbacks.
         private void CreateOrUpdateEntryLine(double price, string label)
         {
+            bool previousSuppress = suppressLineEvents;
             suppressLineEvents = true;
-            if (entryLine == null)
+            try
             {
-                entryLine = Draw.HorizontalLine(this, EntryLineTag, price, Brushes.Black);
-                if (entryLine != null)
+                if (entryLine == null)
                 {
-                    entryLine.Stroke = new Stroke(Brushes.Black, DashStyleHelper.Solid, 2);
-                    entryLine.IsLocked = true;
-                    TrackDrawObject(entryLine);
+                    entryLine = Draw.HorizontalLine(this, EntryLineTag, price, Brushes.Black);
+                    if (entryLine != null)
+                    {
+                        entryLine.Stroke = new Stroke(Brushes.Black, DashStyleHelper.Solid, 2);
+                        entryLine.IsLocked = true;
+                        TrackDrawObject(entryLine);
+                    }
                 }
+                else
+                {
+                    SetLinePrice(entryLine, price);
+                }
+                CreateOrUpdateLabel(EntryLabelTag, price, label, Brushes.Black);
             }
-            else
+            finally
             {
-                SetLinePrice(entryLine, price);
+                suppressLineEvents = previousSuppress;
             }
-            CreateOrUpdateLabel(EntryLabelTag, price, label, Brushes.Black);
-            suppressLineEvents = false;
         }
 
         // Create/update stop line; remains draggable so ChangeOrder can pick up user edits.
         private void CreateOrUpdateStopLine(double price, string label)
         {
+            bool previousSuppress = suppressLineEvents;
             suppressLineEvents = true;
-            if (stopLine == null)
+            try
             {
-                stopLine = Draw.HorizontalLine(this, StopLineTag, price, Brushes.Red);
-                if (stopLine != null)
+                if (stopLine == null)
                 {
-                    stopLine.Stroke = new Stroke(Brushes.Red, DashStyleHelper.Solid, 2);
-                    stopLine.IsLocked = false;
-                    TrackDrawObject(stopLine);
+                    stopLine = Draw.HorizontalLine(this, StopLineTag, price, Brushes.Red);
+                    if (stopLine != null)
+                    {
+                        stopLine.Stroke = new Stroke(Brushes.Red, DashStyleHelper.Solid, 2);
+                        stopLine.IsLocked = false;
+                        TrackDrawObject(stopLine);
+                    }
                 }
+                else
+                {
+                    SetLinePrice(stopLine, price);
+                }
+                CreateOrUpdateLabel(StopLabelTag, price, label, Brushes.Red);
             }
-            else
+            finally
             {
-                SetLinePrice(stopLine, price);
+                suppressLineEvents = previousSuppress;
             }
-            CreateOrUpdateLabel(StopLabelTag, price, label, Brushes.Red);
-            suppressLineEvents = false;
         }
 
         // Create/update target line with unlocked drag behavior for user adjustments.
         private void CreateOrUpdateTargetLine(double price, string label)
         {
+            bool previousSuppress = suppressLineEvents;
             suppressLineEvents = true;
-            if (targetLine == null)
+            try
             {
-                targetLine = Draw.HorizontalLine(this, TargetLineTag, price, Brushes.ForestGreen);
-                if (targetLine != null)
+                if (targetLine == null)
                 {
-                    targetLine.Stroke = new Stroke(Brushes.ForestGreen, DashStyleHelper.Solid, 2);
-                    targetLine.IsLocked = false;
-                    TrackDrawObject(targetLine);
+                    targetLine = Draw.HorizontalLine(this, TargetLineTag, price, Brushes.ForestGreen);
+                    if (targetLine != null)
+                    {
+                        targetLine.Stroke = new Stroke(Brushes.ForestGreen, DashStyleHelper.Solid, 2);
+                        targetLine.IsLocked = false;
+                        TrackDrawObject(targetLine);
+                    }
                 }
+                else
+                {
+                    SetLinePrice(targetLine, price);
+                }
+                CreateOrUpdateLabel(TargetLabelTag, price, label, Brushes.ForestGreen);
             }
-            else
+            finally
             {
-                SetLinePrice(targetLine, price);
+                suppressLineEvents = previousSuppress;
             }
-            CreateOrUpdateLabel(TargetLabelTag, price, label, Brushes.ForestGreen);
-            suppressLineEvents = false;
         }
 
         #endregion
@@ -956,6 +1085,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // CONFIRM step: clamps lines against market, computes quantity, and submits unmanaged entry + OCO stop/target with tag prefix (INVARIANT: self-check must pass and qty>=1).
         private void ConfirmEntry()
         {
+            SetMilestone("ConfirmEntry-Start");
             if (!isArmed || armedDirection == ArmDirection.None)
                 return;
 
@@ -998,11 +1128,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             LogInfo($"{side} entry submitted: qty {qty}, SL {stopPrice:F2}, TP {targetPrice:F2}");
             ApplyLineUpdates();
             UpdateLabelsOnly();
+            SetMilestone("ConfirmEntry-End");
         }
 
         // CLOSE flow: cancels working entry/exit orders, flattens position, and clears HUD/arming state.
         private void ResetAndFlatten(string reason)
         {
+            SetMilestone("ResetAndFlatten-Start");
             LogInfo("CLOSE pressed -> cancel orders + flatten + UI reset");
 
             CancelActiveOrder(entryOrder, "CancelEntry");
@@ -1028,6 +1160,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             currentOco = null;
             hasPendingEntry = false;
             avgEntryPrice = 0;
+            SetMilestone("ResetAndFlatten-End");
         }
 
         // Break-even helper: blocks when not profitable and clamps stop/target to avoid invalid placement.
@@ -1221,9 +1354,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Tick metadata helpers used by all sizing math.
         private double TickSize()
         {
-            return Instrument != null && Instrument.MasterInstrument != null
-                ? Instrument.MasterInstrument.TickSize
-                : 0.01;
+            if (Instrument != null && Instrument.MasterInstrument != null)
+            {
+                double tick = Instrument.MasterInstrument.TickSize;
+                if (tick > 0)
+                    cachedTickSize = tick;
+                return tick;
+            }
+            return cachedTickSize > 0 ? cachedTickSize : 0.01;
         }
 
         private double TickValue()
@@ -1233,7 +1371,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private double RoundToTick(double price)
         {
-            return Instrument.MasterInstrument.RoundToTickSize(price);
+            if (Instrument != null && Instrument.MasterInstrument != null)
+                return Instrument.MasterInstrument.RoundToTickSize(price);
+
+            if (cachedTickSize > 0)
+                return Math.Round(price / cachedTickSize) * cachedTickSize;
+
+            return price;
         }
 
         // Entry reference for risk sizing prefers live average price, otherwise current ARMED entry tracking.
@@ -1470,6 +1614,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 reason = "TickValue<=0";
                 return false;
             }
+            if (tick > 0)
+                cachedTickSize = tick;
 
             entryRef = GetEntryReferenceForRisk();
             if (double.IsNaN(entryRef) || double.IsInfinity(entryRef) || entryRef <= 0)
@@ -1523,12 +1669,27 @@ namespace NinjaTrader.NinjaScript.Strategies
             return barsAgo;
         }
 
+        // Computes label offset in ticks; default preserves legacy tick/pixel max behavior.
+        private double GetLabelOffsetTicks()
+        {
+            switch (LabelOffsetMode)
+            {
+                case LabelOffsetModeOption.TicksOnly:
+                    return Math.Max(0, LabelOffsetTicks);
+                case LabelOffsetModeOption.ApproxPixels:
+                    // Approximate: treat pixels as ticks when no chart scale available; remains optional and non-default.
+                    return Math.Max(Math.Max(0, LabelOffsetTicks), Math.Max(0, LabelOffsetPixels));
+                case LabelOffsetModeOption.Legacy_TicksMax:
+                default:
+                    return Math.Max(Math.Max(0, LabelOffsetTicks), Math.Max(0, LabelOffsetPixels));
+            }
+        }
+
         // Draws or updates text labels with directional offsets; assumes dispatcher-safe context.
         private void CreateOrUpdateLabel(string tag, double price, string text, Brush brush)
         {
             // Offset in ticks, scaled up using pixel preference (fallback tick-based approach for NT8 compatibility).
-            double tickOffset = Math.Max(LabelOffsetTicks, LabelOffsetPixels);
-            double offsetTicks = tickOffset;
+            double offsetTicks = GetLabelOffsetTicks();
             MarketPosition dir = GetWorkingDirection();
             bool isStop = tag == StopLabelTag;
 
@@ -1557,12 +1718,19 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (line == null)
                 return;
+            bool previousSuppress = suppressLineEvents;
             suppressLineEvents = true;
-            if (line.StartAnchor != null)
-                line.StartAnchor.Price = price;
-            if (line.EndAnchor != null)
-                line.EndAnchor.Price = price;
-            suppressLineEvents = false;
+            try
+            {
+                if (line.StartAnchor != null)
+                    line.StartAnchor.Price = price;
+                if (line.EndAnchor != null)
+                    line.EndAnchor.Price = price;
+            }
+            finally
+            {
+                suppressLineEvents = previousSuppress;
+            }
         }
 
         // Clamp stop/target to stay one tick off current bid/ask; protects unmanaged orders from instantly triggering.
@@ -1612,34 +1780,50 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Remove all strategy-owned draw objects and reset caches; used on disarm and cleanup.
         private void RemoveAllDrawObjects()
         {
+            SetMilestone("RemoveAllDrawObjects-Start");
+            bool previousSuppress = suppressLineEvents;
             suppressLineEvents = true;
-            RemoveDrawObject(EntryLineTag);
-            RemoveDrawObject(StopLineTag);
-            RemoveDrawObject(TargetLineTag);
-            RemoveDrawObject(EntryLabelTag);
-            RemoveDrawObject(StopLabelTag);
-            RemoveDrawObject(TargetLabelTag);
-            foreach (var obj in trackedDrawObjects)
+            try
             {
-                if (obj != null && obj.Tag != null && obj.Tag.ToString().StartsWith(OrderTagPrefix, StringComparison.Ordinal))
-                    RemoveDrawObject(obj.Tag);
+                var tags = new HashSet<string>();
+                tags.Add(EntryLineTag);
+                tags.Add(StopLineTag);
+                tags.Add(TargetLineTag);
+                tags.Add(EntryLabelTag);
+                tags.Add(StopLabelTag);
+                tags.Add(TargetLabelTag);
+                foreach (var obj in trackedDrawObjects)
+                {
+                    if (obj != null && obj.Tag != null)
+                    {
+                        string tagStr = obj.Tag.ToString();
+                        if (!string.IsNullOrEmpty(tagStr) && tagStr.StartsWith(OrderTagPrefix, StringComparison.Ordinal))
+                            tags.Add(tagStr);
+                    }
+                }
+                foreach (var tag in tags)
+                    TryRemoveDrawObject(tag);
+                trackedDrawObjects.Clear();
+                entryLine = null;
+                stopLine = null;
+                targetLine = null;
+                entryLineDirty = false;
+                stopLineDirty = false;
+                targetLineDirty = false;
+                lastEntryLabel = null;
+                lastStopLabel = null;
+                lastTargetLabel = null;
+                cachedEntryLabelText = null;
+                cachedStopLabelText = null;
+                cachedTargetLabelText = null;
+                cachedQtyLabelText = null;
+                cachedRrLabelText = null;
             }
-            trackedDrawObjects.Clear();
-            entryLine = null;
-            stopLine = null;
-            targetLine = null;
-            entryLineDirty = false;
-            stopLineDirty = false;
-            targetLineDirty = false;
-            lastEntryLabel = null;
-            lastStopLabel = null;
-            lastTargetLabel = null;
-            cachedEntryLabelText = null;
-            cachedStopLabelText = null;
-            cachedTargetLabelText = null;
-            cachedQtyLabelText = null;
-            cachedRrLabelText = null;
-            suppressLineEvents = false;
+            finally
+            {
+                suppressLineEvents = previousSuppress;
+            }
+            SetMilestone("RemoveAllDrawObjects-End");
         }
 
         // Track draw objects to avoid duplicates and simplify cleanup.
@@ -1652,9 +1836,63 @@ namespace NinjaTrader.NinjaScript.Strategies
             trackedDrawObjects.Add(obj);
         }
 
+        // Type-safe removal helper; convert tags to string to satisfy RemoveDrawObject signature.
+        private void TryRemoveDrawObject(string tag)
+        {
+            if (tag == null)
+                return;
+            try
+            {
+                RemoveDrawObject(tag);
+            }
+            catch (Exception ex)
+            {
+                if ((DateTime.Now - lastCleanupLogTime).TotalSeconds >= 1)
+                {
+                    lastCleanupLogTime = DateTime.Now;
+                    Print($"[RiskRay][{OrderTagPrefix}] Draw cleanup skipped: {ex.Message}");
+                }
+            }
+        }
+
         #endregion
 
         #region Logging & Diagnostics
+
+        // Safe dispatcher helpers: UI calls no-op if dispatcher unavailable; errors throttled to avoid noisy logs.
+        private void UiInvoke(Action action)
+        {
+            if (action == null)
+                return;
+            Dispatcher dispatcher = ChartControl?.Dispatcher;
+            if (dispatcher == null || dispatcher.HasShutdownStarted)
+                return;
+            try
+            {
+                dispatcher.Invoke(action);
+            }
+            catch (Exception ex)
+            {
+                LogUiError("UiInvoke", ex);
+            }
+        }
+
+        private void UiBeginInvoke(Action action)
+        {
+            if (action == null)
+                return;
+            Dispatcher dispatcher = ChartControl?.Dispatcher;
+            if (dispatcher == null || dispatcher.HasShutdownStarted)
+                return;
+            try
+            {
+                dispatcher.InvokeAsync(action);
+            }
+            catch (Exception ex)
+            {
+                LogUiError("UiBeginInvoke", ex);
+            }
+        }
 
         // Level-gated info logger for user actions and state transitions.
         private void LogInfo(string message)
@@ -1662,6 +1900,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (LogLevelSetting == LogLevelOption.Off)
                 return;
             Print($"[RiskRay][{OrderTagPrefix}] {message}");
+        }
+
+        // Milestone helper for stability diagnostics (no spam).
+        private void SetMilestone(string marker)
+        {
+            lastMilestone = marker;
+            lastMilestoneTime = DateTime.Now;
+        }
+
+        private void LogUiError(string context, Exception ex)
+        {
+            if ((DateTime.Now - lastUiErrorLogTime).TotalSeconds < 1)
+                return;
+            lastUiErrorLogTime = DateTime.Now;
+            Print($"[RiskRay][{OrderTagPrefix}][UI] {context}: {ex.Message}");
         }
 
         // Clamp logs are throttled to once per second to avoid spam while dragging near market.
@@ -1699,34 +1952,51 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // Hook chart mouse-up to finalize drag operations (UI thread).
+        // Hook chart mouse-up on UI thread; actual finalize work is marshaled back to strategy thread.
         private void AttachChartEvents()
         {
-            if (chartEventsAttached || ChartControl == null)
-                return;
+            UiInvoke(() =>
+            {
+                if (chartEventsAttached || ChartControl == null)
+                    return;
 
-            ChartControl.MouseLeftButtonUp += ChartControl_MouseLeftButtonUp;
-            chartEventsAttached = true;
+                ChartControl.MouseLeftButtonUp += ChartControl_MouseLeftButtonUp;
+                chartEventsAttached = true;
+                SetMilestone("AttachChartEvents");
+                LogInfo("Chart events attached");
+            });
         }
 
         // Detach chart mouse-up when disposing UI to avoid leaks.
         private void DetachChartEvents()
         {
-            if (!chartEventsAttached || ChartControl == null)
+            if (ChartControl == null || ChartControl.Dispatcher == null || ChartControl.Dispatcher.HasShutdownStarted)
+            {
+                chartEventsAttached = false;
                 return;
+            }
 
-            ChartControl.MouseLeftButtonUp -= ChartControl_MouseLeftButtonUp;
-            chartEventsAttached = false;
+            UiInvoke(() =>
+            {
+                if (!chartEventsAttached || ChartControl == null)
+                    return;
+
+                ChartControl.MouseLeftButtonUp -= ChartControl_MouseLeftButtonUp;
+                chartEventsAttached = false;
+                SetMilestone("DetachChartEvents");
+                LogInfo("Chart events detached");
+            });
         }
 
         private void ChartControl_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
         {
-            SafeExecute("MouseUp", FinalizeDrag);
+            TriggerCustomEvent(_ => SafeExecute("MouseUp", FinalizeDrag), null);
         }
 
-        // Finalizes drag: clamps prices, syncs ChangeOrder, and clears drag flags; ensures stops stay off-market.
+        // Finalizes drag (strategy thread): clamps prices, syncs ChangeOrder, and clears drag flags; ensures stops stay off-market.
         private void FinalizeDrag()
         {
+            SetMilestone("FinalizeDrag-Start");
             bool didLog = false;
             if (isDraggingStop)
             {
@@ -1765,6 +2035,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             isDraggingStop = false;
             isDraggingTarget = false;
+            SetMilestone("FinalizeDrag-End");
         }
 
         // Marks fatal state and logs detailed exception for troubleshooting.
@@ -1772,10 +2043,36 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             fatalError = true;
             fatalErrorMessage = $"{context}: {ex.Message} | {ex.StackTrace}";
+            fatalCount++;
             Print($"[RiskRay][{OrderTagPrefix}][FATAL] {fatalErrorMessage}");
         }
 
-        // Trail user messaging; dispatcher used to satisfy WPF thread affinity.
+        private void ShowNotification(string title, string message)
+        {
+            if (ChartControl == null)
+            {
+                Print($"[RiskRay][{OrderTagPrefix}] {title}: {message}");
+                return;
+            }
+
+            if (NotificationMode == NotificationModeOption.HUD)
+            {
+                if ((DateTime.Now - lastHudMessageTime).TotalSeconds < 0.5)
+                    return;
+                lastHudMessageTime = DateTime.Now;
+                var note = Draw.TextFixed(this, Tag("HUD_NOTIFY"), $"{title}: {message}", TextPosition.TopRight, Brushes.White, new SimpleFont("Segoe UI", 13), Brushes.Black, Brushes.White, 4, DashStyleHelper.Solid, 1, false, null);
+                if (note != null)
+                    TrackDrawObject(note);
+                return;
+            }
+
+            UiBeginInvoke(() =>
+            {
+                MessageBox.Show(message, title, MessageBoxButton.OK, MessageBoxImage.Information);
+            });
+        }
+
+        // Trail user messaging; dispatcher used to satisfy WPF thread affinity. HUD option is non-blocking.
         private void ShowTrailMessage(string message)
         {
             if (ChartControl == null)
@@ -1784,10 +2081,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            ChartControl.Dispatcher.InvokeAsync(() =>
-            {
-                MessageBox.Show(message, "RiskRay - Trail", MessageBoxButton.OK, MessageBoxImage.Information);
-            });
+            ShowNotification("RiskRay - Trail", message);
         }
 
         // Break-even blocked dialog; throttled and dispatcher-bound to avoid repeated popups during flat/profit checks.
@@ -1803,7 +2097,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
 
             isBeDialogOpen = true;
-            ChartControl.Dispatcher.InvokeAsync(() =>
+            if (NotificationMode == NotificationModeOption.HUD)
+            {
+                ShowNotification("RiskRay - Break Even", "BE is not allowed because the position is not in profit yet. Needs at least +1 tick.");
+                lastBeDialogTime = DateTime.Now;
+                isBeDialogOpen = false;
+                return;
+            }
+
+            UiBeginInvoke(() =>
             {
                 try
                 {
@@ -1868,6 +2170,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             double point = Instrument?.MasterInstrument?.PointValue ?? 0;
             double usdPerTick = tick * point;
             bool commissionOn = CommissionMode == CommissionModeOption.On;
+            if (tick > 0)
+                cachedTickSize = tick;
 
             LogInfo($"SelfCheck: Instrument={Instrument?.FullName}, TickSize={tick}, PointValue={point}, UsdPerTick={usdPerTick}, MaxContracts={MaxContracts}, MaxRiskUsd={FixedRiskUSD}, CommissionOn={commissionOn}");
 
@@ -1915,10 +2219,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            ChartControl.Dispatcher.InvokeAsync(() =>
-            {
-                MessageBox.Show($"RiskRay Self-check failed: {selfCheckReason}. Orders are blocked until fixed. Check instrument settings and restart the strategy.", "RiskRay - Self-check", MessageBoxButton.OK, MessageBoxImage.Error);
-            });
+            ShowNotification("RiskRay - Self-check", $"RiskRay Self-check failed: {selfCheckReason}. Orders are blocked until fixed. Check instrument settings and restart the strategy.");
         }
 
         // Prevent label skip logs from spamming more than once per second.
