@@ -50,16 +50,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             Debug
         }
 
-        private const string EntryTag = "RiskRayEntry";
-        private const string StopTag = "RiskRayStop";
-        private const string TargetTag = "RiskRayTarget";
-        private const string EntryLabelTag = "RiskRayEntryLbl";
-        private const string StopLabelTag = "RiskRayStopLbl";
-        private const string TargetLabelTag = "RiskRayTargetLbl";
-        private const string EntrySignal = "RR_ENTRY";
-        private const string StopSignal = "RR_STOP";
-        private const string TargetSignal = "RR_TARGET";
-
         private Grid uiRoot;
         private Button buyButton;
         private Button sellButton;
@@ -191,6 +181,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "DebugBlink", Order = 17, GroupName = "Debug")]
         public bool DebugBlink { get; set; }
 
+        [NinjaScriptProperty]
+        [Display(Name = "OrderTagPrefix", Order = 10, GroupName = "RiskRay - IDs")]
+        public string OrderTagPrefix { get; set; }
+
         #endregion
 
         protected override void OnStateChange()
@@ -225,6 +219,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 BreakEvenPlusTicks = 0;
                 TrailOffsetTicks = 20;
                 DebugBlink = false;
+                OrderTagPrefix = "RR_";
             }
             else if (State == State.Configure)
             {
@@ -245,7 +240,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 DisposeUi();
                 StopBlinkTimer();
                 RemoveAllDrawObjects();
-                Print($"[RiskRay] [State.Terminated] state={DescribeState()} fatal={fatalError} detail={fatalErrorMessage}");
+                Print($"[RiskRay][{OrderTagPrefix}] [State.Terminated] state={DescribeState()} fatal={fatalError} detail={fatalErrorMessage}");
             }
         }
 
@@ -293,14 +288,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (order == null)
                     return;
 
-                if (order.Name == EntrySignal)
+                if (order.Name == EntrySignalLong || order.Name == EntrySignalShort)
                     entryOrder = order;
                 else if (order.Name == StopSignal)
                     stopOrder = order;
                 else if (order.Name == TargetSignal)
                     targetOrder = order;
 
-                if (order.OrderState == OrderState.Filled && order.Name == EntrySignal)
+                if (order.OrderState == OrderState.Filled && (order.Name == EntrySignalLong || order.Name == EntrySignalShort))
                 {
                     avgEntryPrice = order.AverageFillPrice;
                     hasPendingEntry = false;
@@ -346,7 +341,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (execution == null || execution.Order == null)
                     return;
 
-                if (execution.Order.Name == EntrySignal)
+                if (execution.Order.Name == EntrySignalLong || execution.Order.Name == EntrySignalShort)
                     avgEntryPrice = execution.Order.AverageFillPrice;
 
                 if (execution.Order.Name == StopSignal || execution.Order.Name == TargetSignal)
@@ -598,6 +593,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void OnBuyClicked(object sender, RoutedEventArgs e)
         {
+            LogInfo("UserClick: BUYARM");
             SafeExecute("OnBuyClicked", () =>
             {
                 if (Position.MarketPosition != MarketPosition.Flat || entryOrder != null)
@@ -619,6 +615,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void OnSellClicked(object sender, RoutedEventArgs e)
         {
+            LogInfo("UserClick: SELLARM");
             SafeExecute("OnSellClicked", () =>
             {
                 if (Position.MarketPosition != MarketPosition.Flat || entryOrder != null)
@@ -642,22 +639,25 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             try
             {
-                Print("[RiskRay] CLOSE click received");
+                LogInfo("UserClick: CLOSE");
+                Print($"[RiskRay][{OrderTagPrefix}] CLOSE click received");
                 ResetAndFlatten("UserClose");
             }
             catch (Exception ex)
             {
-                Print("[RiskRay] CLOSE exception: " + ex);
+                Print($"[RiskRay][{OrderTagPrefix}] CLOSE exception: " + ex);
             }
         }
 
         private void OnBeClicked(object sender, RoutedEventArgs e)
         {
+            LogInfo("UserClick: BE");
             SafeExecute("OnBeClicked", MoveStopToBreakEven);
         }
 
         private void OnTrailClicked(object sender, RoutedEventArgs e)
         {
+            LogInfo("UserClick: TRAIL");
             SafeExecute("OnTrailClicked", ExecuteTrailStop);
         }
 
@@ -829,7 +829,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             suppressLineEvents = true;
             if (entryLine == null)
             {
-                entryLine = Draw.HorizontalLine(this, EntryTag, price, Brushes.Black);
+                entryLine = Draw.HorizontalLine(this, EntryLineTag, price, Brushes.Black);
                 if (entryLine != null)
                 {
                     entryLine.Stroke = new Stroke(Brushes.Black, DashStyleHelper.Solid, 2);
@@ -850,7 +850,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             suppressLineEvents = true;
             if (stopLine == null)
             {
-                stopLine = Draw.HorizontalLine(this, StopTag, price, Brushes.Red);
+                stopLine = Draw.HorizontalLine(this, StopLineTag, price, Brushes.Red);
                 if (stopLine != null)
                 {
                     stopLine.Stroke = new Stroke(Brushes.Red, DashStyleHelper.Solid, 2);
@@ -871,7 +871,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             suppressLineEvents = true;
             if (targetLine == null)
             {
-                targetLine = Draw.HorizontalLine(this, TargetTag, price, Brushes.ForestGreen);
+                targetLine = Draw.HorizontalLine(this, TargetLineTag, price, Brushes.ForestGreen);
                 if (targetLine != null)
                 {
                     targetLine.Stroke = new Stroke(Brushes.ForestGreen, DashStyleHelper.Solid, 2);
@@ -915,10 +915,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             OrderAction entryAction = armedDirection == ArmDirection.Long ? OrderAction.Buy : OrderAction.SellShort;
             OrderAction stopAction = armedDirection == ArmDirection.Long ? OrderAction.Sell : OrderAction.BuyToCover;
             OrderAction targetAction = stopAction;
+            string entryName = armedDirection == ArmDirection.Long ? EntrySignalLong : EntrySignalShort;
 
             SafeExecute("SubmitOrders", () =>
             {
-                entryOrder = SubmitOrderUnmanaged(0, entryAction, OrderType.Market, qty, 0, 0, null, EntrySignal);
+                entryOrder = SubmitOrderUnmanaged(0, entryAction, OrderType.Market, qty, 0, 0, null, entryName);
                 currentOco = Guid.NewGuid().ToString("N");
                 stopOrder = SubmitOrderUnmanaged(0, stopAction, OrderType.StopMarket, qty, 0, stopPrice, currentOco, StopSignal);
                 targetOrder = SubmitOrderUnmanaged(0, targetAction, OrderType.Limit, qty, targetPrice, 0, currentOco, TargetSignal);
@@ -947,7 +948,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (qty > 0)
                 {
                     OrderAction action = Position.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.BuyToCover;
-                    SafeExecute("ClosePosition", () => SubmitOrderUnmanaged(0, action, OrderType.Market, qty, 0, 0, null, "RR_CLOSE"));
+                    SafeExecute("ClosePosition", () => SubmitOrderUnmanaged(0, action, OrderType.Market, qty, 0, 0, null, CloseSignal));
                 }
             }
 
@@ -1079,6 +1080,26 @@ namespace NinjaTrader.NinjaScript.Strategies
         #endregion
 
         #region Helpers
+
+        private string Tag(string suffix)
+        {
+            return $"{OrderTagPrefix}{suffix}";
+        }
+
+        private string EntryLineTag => Tag("ENTRY_LINE");
+        private string StopLineTag => Tag("STOP_LINE");
+        private string TargetLineTag => Tag("TARGET_LINE");
+        private string EntryLabelTag => Tag("ENTRY_LABEL");
+        private string StopLabelTag => Tag("STOP_LABEL");
+        private string TargetLabelTag => Tag("TARGET_LABEL");
+
+        private string EntrySignalLong => Tag("ENTRY_LONG");
+        private string EntrySignalShort => Tag("ENTRY_SHORT");
+        private string StopSignal => Tag("SL");
+        private string TargetSignal => Tag("TP");
+        private string CloseSignal => Tag("CLOSE");
+        private string BeSignal => Tag("BE");
+        private string TrailSignal => Tag("TRAIL");
 
         private MarketPosition GetWorkingDirection()
         {
@@ -1481,15 +1502,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void RemoveAllDrawObjects()
         {
             suppressLineEvents = true;
-            RemoveDrawObject(EntryTag);
-            RemoveDrawObject(StopTag);
-            RemoveDrawObject(TargetTag);
+            RemoveDrawObject(EntryLineTag);
+            RemoveDrawObject(StopLineTag);
+            RemoveDrawObject(TargetLineTag);
             RemoveDrawObject(EntryLabelTag);
             RemoveDrawObject(StopLabelTag);
             RemoveDrawObject(TargetLabelTag);
             foreach (var obj in trackedDrawObjects)
             {
-                if (obj != null && obj.Tag != null)
+                if (obj != null && obj.Tag != null && obj.Tag.ToString().StartsWith(OrderTagPrefix, StringComparison.Ordinal))
                     RemoveDrawObject(obj.Tag);
             }
             trackedDrawObjects.Clear();
@@ -1523,7 +1544,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (LogLevelSetting == LogLevelOption.Off)
                 return;
-            Print($"[RiskRay] {message}");
+            Print($"[RiskRay][{OrderTagPrefix}] {message}");
         }
 
         private void LogClampOnce(string message)
@@ -1533,7 +1554,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if ((DateTime.Now - lastClampLogTime).TotalSeconds < 1)
                 return;
             lastClampLogTime = DateTime.Now;
-            Print($"[RiskRay] {message}");
+            Print($"[RiskRay][{OrderTagPrefix}] {message}");
         }
 
         private void LogQtyBlocked()
@@ -1543,7 +1564,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if ((DateTime.Now - lastQtyBlockLogTime).TotalSeconds < 1)
                 return;
             lastQtyBlockLogTime = DateTime.Now;
-            Print("[RiskRay] Qty < 1 => block confirmation");
+            Print($"[RiskRay][{OrderTagPrefix}] Qty < 1 => block confirmation");
         }
 
         private void SafeExecute(string context, Action action)
@@ -1627,14 +1648,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             fatalError = true;
             fatalErrorMessage = $"{context}: {ex.Message} | {ex.StackTrace}";
-            Print($"[RiskRay][FATAL] {fatalErrorMessage}");
+            Print($"[RiskRay][{OrderTagPrefix}][FATAL] {fatalErrorMessage}");
         }
 
         private void ShowTrailMessage(string message)
         {
             if (ChartControl == null)
             {
-                Print($"[RiskRay] {message}");
+                Print($"[RiskRay][{OrderTagPrefix}] {message}");
                 return;
             }
 
@@ -1689,14 +1710,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastDragMoveLogTarget = now;
             }
 
-            Print($"[RiskRay][DEBUG] {prefix} {price:F2}");
+            Print($"[RiskRay][{OrderTagPrefix}][DEBUG] {prefix} {price:F2}");
         }
 
         private void LogDebug(string message)
         {
             if (LogLevelSetting != LogLevelOption.Debug)
                 return;
-            Print($"[RiskRay][DEBUG] {message}");
+            Print($"[RiskRay][{OrderTagPrefix}][DEBUG] {message}");
         }
 
         private bool ShouldLogDebug()
