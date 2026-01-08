@@ -109,6 +109,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lastBeDialogTime = DateTime.MinValue;
         private bool blinkBuy;
         private bool blinkSell;
+        private bool selfCheckDone;
+        private bool selfCheckFailed;
+        private string selfCheckReason;
+        private bool selfCheckDialogShown;
         private int blinkTickCounter;
 
         #region Properties
@@ -218,6 +222,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 LabelHorizontalShift = 0;
                 BreakEvenPlusTicks = 0;
                 TrailOffsetTicks = 20;
+                selfCheckDone = false;
+                selfCheckFailed = false;
+                selfCheckReason = null;
+                selfCheckDialogShown = false;
                 DebugBlink = false;
                 OrderTagPrefix = "RR_";
             }
@@ -231,6 +239,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Realtime)
             {
+                RunSelfCheckOnce();
                 SafeExecute("StartBlinkTimer", StartBlinkTimer);
                 SafeExecute("AttachChartEvents", AttachChartEvents);
             }
@@ -793,7 +802,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 stopPrice = stop;
                 SetLinePrice(stopLine, stopPrice);
                 LogDebugDrag("DragMove SL ->", stopPrice);
-                if (IsOrderActive(stopOrder) && Position.MarketPosition != MarketPosition.Flat)
+                if (IsOrderActive(stopOrder) && Position.MarketPosition != MarketPosition.Flat && EnsureSelfCheckPassed())
                 {
                     double currentStop = stopOrder.StopPrice;
                     if (Math.Abs(currentStop - stopPrice) >= TickSize() / 8)
@@ -808,7 +817,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 targetPrice = target;
                 SetLinePrice(targetLine, targetPrice);
                 LogDebugDrag("DragMove TP ->", targetPrice);
-                if (targetOrder != null && targetOrder.OrderState == OrderState.Working)
+                if (targetOrder != null && targetOrder.OrderState == OrderState.Working && EnsureSelfCheckPassed())
                     SafeExecute("ChangeOrder-TargetDrag", () => ChangeOrder(targetOrder, targetOrder.Quantity, targetPrice, targetOrder.StopPrice));
             }
 
@@ -896,6 +905,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!isArmed || armedDirection == ArmDirection.None)
                 return;
 
+            if (!EnsureSelfCheckPassed())
+                return;
+
             bool clamped;
             EnforceValidity(GetWorkingDirection(), ref stopPrice, ref targetPrice, out clamped);
             if (clamped)
@@ -971,6 +983,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
+            if (!EnsureSelfCheckPassed())
+                return;
+
             double marketRef = Position.MarketPosition == MarketPosition.Long ? GetCurrentBid() : GetCurrentAsk();
             if (marketRef <= 0)
                 marketRef = Close[0];
@@ -1019,6 +1034,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ShowTrailMessage("TRAIL: No open position.");
                 return;
             }
+
+            if (!EnsureSelfCheckPassed())
+                return;
 
             if (!IsOrderActive(stopOrder))
             {
@@ -1630,12 +1648,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 targetLineDirty = false;
                 if (clamped)
                     LogClampOnce("Line clamped at drag end");
-                if (IsOrderActive(stopOrder) && Position.MarketPosition != MarketPosition.Flat)
+                if (IsOrderActive(stopOrder) && Position.MarketPosition != MarketPosition.Flat && EnsureSelfCheckPassed())
                 {
                     SafeExecute("ChangeOrder-StopDragEnd", () => ChangeOrder(stopOrder, stopOrder.Quantity, stopOrder.LimitPrice, stopPrice));
                     LogInfo($"SL modified -> {stopPrice:F2}");
                 }
-                if (targetOrder != null && targetOrder.OrderState == OrderState.Working)
+                if (targetOrder != null && targetOrder.OrderState == OrderState.Working && EnsureSelfCheckPassed())
                     SafeExecute("ChangeOrder-TargetDragEnd", () => ChangeOrder(targetOrder, targetOrder.Quantity, targetPrice, targetOrder.StopPrice));
                 UpdateLabelsOnly();
             }
@@ -1726,6 +1744,67 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return false;
             lastDebugLogTime = DateTime.Now;
             return true;
+        }
+
+        private void RunSelfCheckOnce()
+        {
+            if (selfCheckDone)
+                return;
+
+            selfCheckDone = true;
+            double tick = TickSize();
+            double point = Instrument?.MasterInstrument?.PointValue ?? 0;
+            double usdPerTick = tick * point;
+            bool commissionOn = CommissionMode == CommissionModeOption.On;
+
+            LogInfo($"SelfCheck: Instrument={Instrument?.FullName}, TickSize={tick}, PointValue={point}, UsdPerTick={usdPerTick}, MaxContracts={MaxContracts}, MaxRiskUsd={FixedRiskUSD}, CommissionOn={commissionOn}");
+
+            List<string> reasons = new List<string>();
+            if (tick <= 0) reasons.Add("TickSize invalid");
+            if (point <= 0) reasons.Add("PointValue invalid");
+            if (usdPerTick <= 0) reasons.Add("UsdPerTick invalid");
+            if (MaxContracts <= 0) reasons.Add("MaxContracts invalid");
+            if (FixedRiskUSD <= 0) reasons.Add("MaxRiskUsd invalid");
+
+            if (reasons.Count > 0)
+            {
+                selfCheckFailed = true;
+                selfCheckReason = string.Join("; ", reasons);
+                LogInfo($"SelfCheck FAILED: {selfCheckReason}");
+                ShowSelfCheckFailedDialog();
+            }
+            else
+            {
+                selfCheckFailed = false;
+                selfCheckReason = null;
+            }
+        }
+
+        private bool EnsureSelfCheckPassed()
+        {
+            if (!selfCheckFailed)
+                return true;
+
+            ShowSelfCheckFailedDialog();
+            return false;
+        }
+
+        private void ShowSelfCheckFailedDialog()
+        {
+            if (selfCheckDialogShown)
+                return;
+
+            selfCheckDialogShown = true;
+            if (ChartControl == null)
+            {
+                Print($"[RiskRay][{OrderTagPrefix}] Orders blocked: Self-check failed: {selfCheckReason}");
+                return;
+            }
+
+            ChartControl.Dispatcher.InvokeAsync(() =>
+            {
+                MessageBox.Show($"RiskRay Self-check failed: {selfCheckReason}. Orders are blocked until fixed. Check instrument settings and restart the strategy.", "RiskRay - Self-check", MessageBoxButton.OK, MessageBoxImage.Error);
+            });
         }
 
         private bool ShouldLogLabelSkip()
