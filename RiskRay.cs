@@ -144,6 +144,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int fatalCount;
         private DateTime lastHudMessageTime = DateTime.MinValue;
         private DateTime lastUiUnavailableLogTime = DateTime.MinValue;
+        private readonly string instanceId = Guid.NewGuid().ToString("N").Substring(0, 6);
+        private int stateChangeSeq = 0;
+        private bool isRunningInstance;
 
         #endregion
 
@@ -240,6 +243,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Lifecycle gate: builds UI in historical for chart availability, runs self-check once in realtime, and cleans up unmanaged artifacts on termination.
         protected override void OnStateChange()
         {
+            stateChangeSeq++;
+            Print($"{Prefix("TRACE")} OnStateChange seq={stateChangeSeq} state={State}");
             if (State == State.SetDefaults)
             {
                 Name = "RiskRay";
@@ -288,32 +293,70 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Historical)
             {
+                Print($"{Prefix("TRACE")} State.Historical begin");
+                TryMarkRunningInstance();
                 SetMilestone("Historical");
                 SafeExecute("BuildUi", BuildUi);
                 SafeExecute("AttachChartEvents", AttachChartEvents);
+                Print($"{Prefix("TRACE")} State.Historical end");
             }
             else if (State == State.Realtime)
             {
+                Print($"{Prefix("TRACE")} State.Realtime begin");
+                TryMarkRunningInstance();
                 SetMilestone("Realtime");
                 RunSelfCheckOnce();
                 SafeExecute("StartBlinkTimer", StartBlinkTimer);
                 SafeExecute("AttachChartEvents", AttachChartEvents);
+                Print($"{Prefix("TRACE")} State.Realtime end");
             }
             else if (State == State.Terminated)
             {
+                Print($"{Prefix("TRACE")} State.Terminated begin");
+                bool chartNull = ChartControl == null;
+                bool dispOk = ChartControl?.Dispatcher != null && !(ChartControl?.Dispatcher.HasShutdownStarted ?? true);
+                Print($"{Prefix("TRACE")} Terminated: dispatcherOk={dispOk} chartNull={chartNull}");
                 SetMilestone("Terminated-Start");
                 try
                 {
-                    DetachChartEvents();
-                    StopBlinkTimer();
-                    DisposeUi(true);
-                    RemoveAllDrawObjects();
-                    Print($"[RiskRay][{OrderTagPrefix}] [State.Terminated] state={DescribeState()} fatal={fatalError} detail={fatalErrorMessage} milestone={lastMilestone} at={lastMilestoneTime:o} fatalCount={fatalCount}");
+                    if (chartNull)
+                    {
+                        Print($"{Prefix("TRACE")} Terminated helper instance (chartNull=True) -> skipping UI cleanup");
+                        RemoveAllDrawObjects();
+                    }
+                    else if (!dispOk)
+                    {
+                        DetachChartEvents();
+                        StopBlinkTimer();
+                        DisposeUi(true);
+                        RemoveAllDrawObjects();
+                    }
+                    else
+                    {
+                        DetachChartEvents();
+                        StopBlinkTimer();
+                        DisposeUi(true);
+                        RemoveAllDrawObjects();
+                    }
+                    Print($"{Prefix()} [State.Terminated] state={DescribeState()} fatal={fatalError} detail={fatalErrorMessage} milestone={lastMilestone} at={lastMilestoneTime:o} fatalCount={fatalCount}");
                 }
                 catch (Exception ex)
                 {
                     LogFatal("OnStateChange.Terminated", ex);
                 }
+                Print($"{Prefix("TRACE")} State.Terminated end");
+            }
+        }
+
+        private void TryMarkRunningInstance()
+        {
+            if (isRunningInstance)
+                return;
+            Dispatcher dispatcher = ChartControl?.Dispatcher;
+            if (ChartControl != null && dispatcher != null && !dispatcher.HasShutdownStarted)
+            {
+                isRunningInstance = true;
+                Print($"{Prefix("TRACE")} RUNNING_INSTANCE chartAttached=True instrument={Instrument?.FullName}");
             }
         }
 
@@ -626,7 +669,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (sellButton != null)
                     sellButton.Opacity = blinkSell ? (blinkOn ? 1 : 0.55) : 1;
                 if (DebugBlink)
-                    Print($"[RiskRay][DEBUG] UpdateUiState: blinkBuy={blinkBuy} blinkSell={blinkSell} phase={(blinkOn ? "on" : "off")}");
+                    Print($"{Prefix("DEBUG")} UpdateUiState: blinkBuy={blinkBuy} blinkSell={blinkSell} phase={(blinkOn ? "on" : "off")}");
                 if (closeButton != null)
                 {
                     closeButton.IsEnabled = isArmed || Position.MarketPosition != MarketPosition.Flat || entryOrder != null;
@@ -655,7 +698,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 blinkBuy = isArmed && armedDirection == ArmDirection.Long;
                 blinkSell = isArmed && armedDirection == ArmDirection.Short;
                 if (DebugBlink)
-                    Print($"[RiskRay][DEBUG] UpdateArmButtonsUI: blinkBuy={blinkBuy} blinkSell={blinkSell} phase={(blinkOn ? "on" : "off")} btnNull buy:{buyButton == null} sell:{sellButton == null}");
+                    Print($"{Prefix("DEBUG")} UpdateArmButtonsUI: blinkBuy={blinkBuy} blinkSell={blinkSell} phase={(blinkOn ? "on" : "off")} btnNull buy:{buyButton == null} sell:{sellButton == null}");
                 if (buyButton != null)
                     buyButton.Content = (isArmed && armedDirection == ArmDirection.Long) ? "BUY ARMED" : "BUY";
                 if (sellButton != null)
@@ -691,7 +734,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         blinkOn = !blinkOn;
                         if (DebugBlink && blinkTickCounter % 10 == 0)
                         {
-                            Print($"[RiskRay][DEBUG] Blink tick #{blinkTickCounter} flags: buy={blinkBuy} sell={blinkSell} phase={(blinkOn ? "on" : "off")} btns null? buy:{buyButton == null} sell:{sellButton == null}");
+                            Print($"{Prefix("DEBUG")} Blink tick #{blinkTickCounter} flags: buy={blinkBuy} sell={blinkSell} phase={(blinkOn ? "on" : "off")} btns null? buy:{buyButton == null} sell:{sellButton == null}");
                         }
                         UpdateUiState();
                     });
@@ -793,12 +836,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             try
             {
                 LogInfo("UserClick: CLOSE");
-                Print($"[RiskRay][{OrderTagPrefix}] CLOSE click received");
+                Print($"{Prefix()} CLOSE click received");
                 ResetAndFlatten("UserClose");
             }
             catch (Exception ex)
             {
-                Print($"[RiskRay][{OrderTagPrefix}] CLOSE exception: " + ex);
+                Print($"{Prefix()} CLOSE exception: " + ex);
             }
         }
 
@@ -1557,7 +1600,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             string ptsTicks = FormatPointsAndTicks(rewardTicks);
             string label = $"TP: +{CurrencySymbol()}{reward:F2} ({ptsTicks})";
             if (DebugBlink)
-                Print($"[RiskRay][DEBUG] TP label -> $={reward:F2}, targetTicks={rewardTicks:F1}, ptsTicks={ptsTicks}");
+                Print($"{Prefix("DEBUG")} TP label -> $={reward:F2}, targetTicks={rewardTicks:F1}, ptsTicks={ptsTicks}");
             cachedTargetLabelText = label;
             return label;
         }
@@ -1851,7 +1894,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if ((DateTime.Now - lastCleanupLogTime).TotalSeconds >= 1)
                 {
                     lastCleanupLogTime = DateTime.Now;
-                    Print($"[RiskRay][{OrderTagPrefix}] Draw cleanup skipped: {ex.Message}");
+                    Print($"{Prefix()} Draw cleanup skipped: {ex.Message}");
                 }
             }
         }
@@ -1859,6 +1902,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         #endregion
 
         #region Logging & Diagnostics
+
+        private string Prefix(string level = null)
+        {
+            var tag = string.IsNullOrWhiteSpace(OrderTagPrefix) ? "RR_" : OrderTagPrefix;
+            return level == null
+                ? $"[RiskRay][{tag}][I:{instanceId}]"
+                : $"[RiskRay][{tag}][I:{instanceId}][{level}]";
+        }
 
         // Safe dispatcher helpers: UI calls no-op if dispatcher unavailable; errors throttled to avoid noisy logs.
         private void UiInvoke(Action action)
@@ -1868,10 +1919,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             Dispatcher dispatcher = ChartControl?.Dispatcher;
             if (dispatcher == null || dispatcher.HasShutdownStarted)
             {
-                if ((DateTime.Now - lastUiUnavailableLogTime).TotalSeconds > 1)
+                if (isRunningInstance && (DateTime.Now - lastUiUnavailableLogTime).TotalSeconds > 1)
                 {
                     lastUiUnavailableLogTime = DateTime.Now;
-                    Print($"[RiskRay][{OrderTagPrefix}][UI] Dispatcher unavailable for UiInvoke (null or shutdown)");
+                    Print($"{Prefix("UI")} Dispatcher unavailable for UiInvoke (null or shutdown)");
                 }
                 return;
             }
@@ -1902,10 +1953,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             Dispatcher dispatcher = ChartControl?.Dispatcher;
             if (dispatcher == null || dispatcher.HasShutdownStarted)
             {
-                if ((DateTime.Now - lastUiUnavailableLogTime).TotalSeconds > 1)
+                if (isRunningInstance && (DateTime.Now - lastUiUnavailableLogTime).TotalSeconds > 1)
                 {
                     lastUiUnavailableLogTime = DateTime.Now;
-                    Print($"[RiskRay][{OrderTagPrefix}][UI] Dispatcher unavailable for UiBeginInvoke (null or shutdown)");
+                    Print($"{Prefix("UI")} Dispatcher unavailable for UiBeginInvoke (null or shutdown)");
                 }
                 return;
             }
@@ -1934,7 +1985,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (LogLevelSetting == LogLevelOption.Off)
                 return;
-            Print($"[RiskRay][{OrderTagPrefix}] {message}");
+            Print($"{Prefix()} {message}");
         }
 
         // Milestone helper for stability diagnostics (no spam).
@@ -1949,7 +2000,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if ((DateTime.Now - lastUiErrorLogTime).TotalSeconds < 1)
                 return;
             lastUiErrorLogTime = DateTime.Now;
-            Print($"[RiskRay][{OrderTagPrefix}][UI] {context}: {ex.Message}");
+            Print($"{Prefix("UI")} {context}: {ex.Message}");
         }
 
         // Clamp logs are throttled to once per second to avoid spam while dragging near market.
@@ -1960,7 +2011,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if ((DateTime.Now - lastClampLogTime).TotalSeconds < 1)
                 return;
             lastClampLogTime = DateTime.Now;
-            Print($"[RiskRay][{OrderTagPrefix}] {message}");
+            Print($"{Prefix()} {message}");
         }
 
         // Logs when qty calculation would be <1; throttled to avoid repeat noise.
@@ -1971,7 +2022,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if ((DateTime.Now - lastQtyBlockLogTime).TotalSeconds < 1)
                 return;
             lastQtyBlockLogTime = DateTime.Now;
-            Print($"[RiskRay][{OrderTagPrefix}] Qty < 1 => block confirmation");
+            Print($"{Prefix()} Qty < 1 => block confirmation");
         }
 
         // Wrapper to centralize fatal logging while preserving original context.
@@ -2079,14 +2130,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             fatalError = true;
             fatalErrorMessage = $"{context}: {ex.Message} | {ex.StackTrace}";
             fatalCount++;
-            Print($"[RiskRay][{OrderTagPrefix}][FATAL] {fatalErrorMessage}");
+            Print($"{Prefix("FATAL")} {fatalErrorMessage}");
         }
 
         private void ShowNotification(string title, string message)
         {
             if (ChartControl == null)
             {
-                Print($"[RiskRay][{OrderTagPrefix}] {title}: {message}");
+                Print($"{Prefix()} {title}: {message}");
                 return;
             }
 
@@ -2112,7 +2163,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (ChartControl == null)
             {
-                Print($"[RiskRay][{OrderTagPrefix}] {message}");
+                Print($"{Prefix()} {message}");
                 return;
             }
 
@@ -2174,7 +2225,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastDragMoveLogTarget = now;
             }
 
-            Print($"[RiskRay][{OrderTagPrefix}][DEBUG] {prefix} {price:F2}");
+            Print($"{Prefix("DEBUG")} {prefix} {price:F2}");
         }
 
         // Debug logger gated by Debug level.
@@ -2182,7 +2233,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (LogLevelSetting != LogLevelOption.Debug)
                 return;
-            Print($"[RiskRay][{OrderTagPrefix}][DEBUG] {message}");
+            Print($"{Prefix("DEBUG")} {message}");
         }
 
         // Simple throttle to avoid chatty debug logs.
@@ -2250,7 +2301,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             selfCheckDialogShown = true;
             if (ChartControl == null)
             {
-                Print($"[RiskRay][{OrderTagPrefix}] Orders blocked: Self-check failed: {selfCheckReason}");
+                Print($"{Prefix()} Orders blocked: Self-check failed: {selfCheckReason}");
                 return;
             }
 
