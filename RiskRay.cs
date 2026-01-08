@@ -143,6 +143,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lastMilestoneTime = DateTime.MinValue;
         private int fatalCount;
         private DateTime lastHudMessageTime = DateTime.MinValue;
+        private DateTime lastUiUnavailableLogTime = DateTime.MinValue;
 
         #endregion
 
@@ -1866,14 +1867,31 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             Dispatcher dispatcher = ChartControl?.Dispatcher;
             if (dispatcher == null || dispatcher.HasShutdownStarted)
+            {
+                if ((DateTime.Now - lastUiUnavailableLogTime).TotalSeconds > 1)
+                {
+                    lastUiUnavailableLogTime = DateTime.Now;
+                    Print($"[RiskRay][{OrderTagPrefix}][UI] Dispatcher unavailable for UiInvoke (null or shutdown)");
+                }
                 return;
+            }
             try
             {
-                dispatcher.Invoke(action);
+                dispatcher.Invoke(() =>
+                {
+                    try
+                    {
+                        action();
+                    }
+                    catch (Exception ex)
+                    {
+                        LogFatal("UI.Sync", ex);
+                    }
+                });
             }
             catch (Exception ex)
             {
-                LogUiError("UiInvoke", ex);
+                LogFatal("UiInvoke.Invoke", ex);
             }
         }
 
@@ -1883,14 +1901,31 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             Dispatcher dispatcher = ChartControl?.Dispatcher;
             if (dispatcher == null || dispatcher.HasShutdownStarted)
+            {
+                if ((DateTime.Now - lastUiUnavailableLogTime).TotalSeconds > 1)
+                {
+                    lastUiUnavailableLogTime = DateTime.Now;
+                    Print($"[RiskRay][{OrderTagPrefix}][UI] Dispatcher unavailable for UiBeginInvoke (null or shutdown)");
+                }
                 return;
+            }
             try
             {
-                dispatcher.InvokeAsync(action);
+                dispatcher.InvokeAsync(() =>
+                {
+                    try
+                    {
+                        action();
+                    }
+                    catch (Exception ex)
+                    {
+                        LogFatal("UI.Async", ex);
+                    }
+                });
             }
             catch (Exception ex)
             {
-                LogUiError("UiBeginInvoke", ex);
+                LogFatal("UiBeginInvoke.Schedule", ex);
             }
         }
 
