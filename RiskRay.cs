@@ -106,6 +106,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // Cached draw objects/labels to prevent leakage and redundant re-renders.
         private readonly List<DrawingTool> trackedDrawObjects = new List<DrawingTool>();
+        private readonly HashSet<string> processedExitIds = new HashSet<string>();
         private bool entryLineDirty;
         private bool stopLineDirty;
         private bool targetLineDirty;
@@ -434,7 +435,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (order.OrderState == OrderState.Filled && (order.Name == StopSignal || order.Name == TargetSignal))
                 {
-                    HandlePositionClosed(order.Name);
+                    ProcessExitFill(order, null, "OnOrderUpdate");
                 }
 
                 if (order.OrderState == OrderState.Cancelled)
@@ -471,7 +472,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     avgEntryPrice = execution.Order.AverageFillPrice;
 
                 if (execution.Order.Name == StopSignal || execution.Order.Name == TargetSignal)
-                    HandlePositionClosed(execution.Order.Name);
+                    ProcessExitFill(execution.Order, execution, "OnExecutionUpdate");
             }
             catch (Exception ex)
             {
@@ -497,6 +498,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     hasPendingEntry = false;
                     armedDirection = ArmDirection.None;
                     isArmed = false;
+                    processedExitIds.Clear();
                     RemoveAllDrawObjects();
                     UpdateUiState();
                 }
@@ -1204,6 +1206,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             currentOco = null;
             hasPendingEntry = false;
             avgEntryPrice = 0;
+            processedExitIds.Clear();
             SetMilestone("ResetAndFlatten-End");
         }
 
@@ -1315,6 +1318,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             entryOrder = null;
             avgEntryPrice = 0;
             hasPendingEntry = false;
+            processedExitIds.Clear();
             Disarm();
         }
 
@@ -1510,9 +1514,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (LogLevelSetting == LogLevelOption.Debug && ShouldLogDebug())
             {
                 int qty = CalculateQuantity();
-                double stopTicks = Math.Abs(entryPrice - stopPrice) / TickSize();
-                double targetTicks = Math.Abs(targetPrice - entryPrice) / TickSize();
-                LogDebug($"Sizing: qty {qty}, stopTicks {stopTicks:F1}, targetTicks {targetTicks:F1}");
+                double tick = TickSize();
+                double entryRef = GetEntryReferenceForRisk();
+                double stopTicks = tick > 0 ? Math.Abs(entryRef - stopPrice) / tick : 0;
+                double targetTicks = tick > 0 ? Math.Abs(targetPrice - entryRef) / tick : 0;
+                LogDebug($"Sizing: qty {qty}, stopTicks {stopTicks:F1}, targetTicks {targetTicks:F1}, entryPrice={entryPrice:F2}, stopPrice={stopPrice:F2}, targetPrice={targetPrice:F2}, entryRef={entryRef:F2}");
             }
         }
 
@@ -2382,6 +2388,34 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return entryOrder.Quantity;
 
             return CalculateQuantity();
+        }
+
+        // Deduplicate and log exit fills to avoid repeated cleanup on multi-part events.
+        private void ProcessExitFill(Order order, Execution exec, string source)
+        {
+            if (order == null)
+                return;
+            // Only process final fills for stop/target exits.
+            if (order.OrderState != OrderState.Filled)
+                return;
+            string execId = exec?.ExecutionId;
+            string orderKey = !string.IsNullOrEmpty(order.OrderId) ? $"ORD:{order.OrderId}" : $"ORDNAME:{order.Name}";
+            if (processedExitIds.Contains(orderKey) || (!string.IsNullOrEmpty(execId) && processedExitIds.Contains($"EX:{execId}")))
+            {
+                LogDebug($"Exit fill deduped ({source}) name={order.Name} orderId={order.OrderId} execId={execId}");
+                return;
+            }
+            processedExitIds.Add(orderKey);
+            if (!string.IsNullOrEmpty(execId))
+                processedExitIds.Add($"EX:{execId}");
+
+            if (LogLevelSetting != LogLevelOption.Off)
+            {
+                string execMsg = exec != null ? $" execId={exec.ExecutionId} execQty={exec.Quantity} execPrice={exec.Price:F2}" : string.Empty;
+                LogInfo($"Exit fill handled ({source}) name={order.Name} orderId={order.OrderId} oco={order.Oco} state={order.OrderState} filled={order.Filled}/{order.Quantity} avg={order.AverageFillPrice:F2}{execMsg}");
+            }
+
+            HandlePositionClosed(order.Name);
         }
 
         // Currency symbol helper for HUD labels; defaults to USD.
