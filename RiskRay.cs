@@ -61,6 +61,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             HUD
         }
 
+        public enum OrderTypeMode
+        {
+            Market,
+            Stop,
+            Limit
+        }
+
         // WPF panel controls for manual interaction and blink feedback.
         private Grid uiRoot;
         private Button buyButton;
@@ -68,6 +75,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Button closeButton;
         private Button beButton;
         private Button trailButton;
+        private Button orderTypeButton;
         private DispatcherTimer blinkTimer;
         private EventHandler blinkTickHandler;
         private bool blinkOn;
@@ -87,6 +95,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double stopPrice;
         private double targetPrice;
         private double avgEntryPrice;
+        private OrderTypeMode orderTypeMode = OrderTypeMode.Market;
 
         // Unmanaged order handles and OCO group identifier (OrderTagPrefix invariant).
         private Order entryOrder;
@@ -117,8 +126,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string fatalErrorMessage;
         private bool isDraggingStop;
         private bool isDraggingTarget;
+        private bool isDraggingEntry;
         private DateTime lastDragMoveLogStop = DateTime.MinValue;
         private DateTime lastDragMoveLogTarget = DateTime.MinValue;
+        private DateTime lastDragMoveLogEntry = DateTime.MinValue;
         private bool chartEventsAttached;
         private string cachedEntryLabelText;
         private string cachedStopLabelText;
@@ -192,10 +203,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "LogLevel", Order = 9, GroupName = "Parameters")]
         public LogLevelOption LogLevelSetting { get; set; }
 
-        [Range(0, double.MaxValue), NinjaScriptProperty]
-        [Display(Name = "MaxRiskWarningUSD", Order = 10, GroupName = "Parameters")]
-        public double MaxRiskWarningUSD { get; set; }
-
         [Range(0, int.MaxValue), NinjaScriptProperty]
         [Display(Name = "LabelOffsetTicks", Order = 11, GroupName = "Parameters")]
         public int LabelOffsetTicks { get; set; }
@@ -268,7 +275,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 IncludeCommission = false;
                 fatalError = false;
                 fatalErrorMessage = null;
-                MaxRiskWarningUSD = 0;
                 LabelOffsetTicks = 2;
                 LabelOffsetPixels = 14;
                 LabelBarsRightOffset = 25;
@@ -283,6 +289,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 OrderTagPrefix = "RR_";
                 LabelOffsetMode = LabelOffsetModeOption.Legacy_TicksMax;
                 NotificationMode = NotificationModeOption.MessageBox;
+                orderTypeMode = OrderTypeMode.Market;
                 receivedMarketDataThisSession = false;
                 cachedTickSize = 0;
                 lastMilestone = null;
@@ -394,6 +401,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 receivedMarketDataThisSession = true;
 
+                ProcessEntryLineDrag();
                 UpdateEntryLineFromMarket();
                 ProcessLineDrag(stopLine, ref stopPrice, true);
                 ProcessLineDrag(targetLine, ref targetPrice, false);
@@ -546,23 +554,27 @@ namespace NinjaTrader.NinjaScript.Strategies
                     uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                     uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                     uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                    uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
                     buyButton = CreateButton("BUY", Brushes.DarkGreen, OnBuyClicked);
                     sellButton = CreateButton("SELL", Brushes.DarkRed, OnSellClicked);
                     closeButton = CreateButton("CLOSE", Brushes.DimGray, OnCloseClicked);
+                    orderTypeButton = CreateButton(GetOrderTypeLabel(orderTypeMode), Brushes.DarkSlateGray, OnOrderTypeClicked);
                     beButton = CreateButton("BE", Brushes.DarkSlateBlue, OnBeClicked);
                     trailButton = CreateButton("TRAIL", Brushes.DarkOrange, OnTrailClicked);
 
                     uiRoot.Children.Add(buyButton);
                     uiRoot.Children.Add(sellButton);
                     uiRoot.Children.Add(closeButton);
+                    uiRoot.Children.Add(orderTypeButton);
                     uiRoot.Children.Add(beButton);
                     uiRoot.Children.Add(trailButton);
                     Grid.SetColumn(buyButton, 0);
                     Grid.SetColumn(sellButton, 1);
-                    Grid.SetColumn(closeButton, 2);
-                    Grid.SetColumn(beButton, 3);
-                    Grid.SetColumn(trailButton, 4);
+                    Grid.SetColumn(orderTypeButton, 2);
+                    Grid.SetColumn(closeButton, 3);
+                    Grid.SetColumn(beButton, 4);
+                    Grid.SetColumn(trailButton, 5);
 
                     chartGrid.Children.Add(uiRoot);
                     uiLoaded = true;
@@ -605,6 +617,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 sellButton = null;
                 closeButton = null;
                 beButton = null;
+                orderTypeButton = null;
                 trailButton = null;
                 uiRoot = null;
                 chartGrid = null;
@@ -636,6 +649,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     sellButton.Click -= OnSellClicked;
                 if (closeButton != null)
                     closeButton.Click -= OnCloseClicked;
+                if (orderTypeButton != null)
+                    orderTypeButton.Click -= OnOrderTypeClicked;
                 if (beButton != null)
                     beButton.Click -= OnBeClicked;
                 if (trailButton != null)
@@ -645,6 +660,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 buyButton = null;
                 sellButton = null;
                 closeButton = null;
+                orderTypeButton = null;
                 beButton = null;
                 trailButton = null;
                 uiLoaded = false;
@@ -686,6 +702,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     beButton.IsEnabled = Position.MarketPosition != MarketPosition.Flat && stopOrder != null;
 
                 UpdateArmButtonsUI();
+                UpdateOrderTypeButton();
             });
         }
 
@@ -861,12 +878,75 @@ namespace NinjaTrader.NinjaScript.Strategies
             SafeExecute("OnTrailClicked", ExecuteTrailStop);
         }
 
+        // Order type toggle cycles Market -> Stop -> Limit without disrupting ARMED state.
+        private void OnOrderTypeClicked(object sender, RoutedEventArgs e)
+        {
+            LogInfo("UserClick: ORDERTYPE");
+            SafeExecute("OnOrderTypeClicked", CycleOrderTypeMode);
+        }
+
         #endregion
         #endregion
+
+        // Order type toggle keeps ARMED state intact while rotating entry submission type.
+        private void CycleOrderTypeMode()
+        {
+            OrderTypeMode nextMode;
+            switch (orderTypeMode)
+            {
+                case OrderTypeMode.Market:
+                    nextMode = OrderTypeMode.Stop;
+                    break;
+                case OrderTypeMode.Stop:
+                    nextMode = OrderTypeMode.Limit;
+                    break;
+                case OrderTypeMode.Limit:
+                default:
+                    nextMode = OrderTypeMode.Market;
+                    break;
+            }
+
+            SetOrderTypeMode(nextMode, true);
+        }
+
+        private void SetOrderTypeMode(OrderTypeMode mode, bool logChange)
+        {
+            if (orderTypeMode == mode)
+                return;
+
+            orderTypeMode = mode;
+            UpdateOrderTypeButton();
+            if (logChange)
+                LogInfo($"OrderType set to {GetOrderTypeLabel(orderTypeMode)}");
+            ApplyOrderTypeModeToLines();
+        }
+
+        private void UpdateOrderTypeButton()
+        {
+            if (ChartControl == null || !uiLoaded || orderTypeButton == null)
+                return;
+
+            UiBeginInvoke(() =>
+            {
+                if (orderTypeButton != null)
+                    orderTypeButton.Content = GetOrderTypeLabel(orderTypeMode);
+            });
+        }
+
+        private string GetOrderTypeLabel(OrderTypeMode mode)
+        {
+            return mode.ToString().ToUpperInvariant();
+        }
 
         #region Lines/Draw Objects
 
         #region Arming and lines
+
+        private bool ShouldShowEntryLine()
+        {
+            return orderTypeMode != OrderTypeMode.Market
+                && (isArmed || hasPendingEntry || (Position != null && Position.MarketPosition != MarketPosition.Flat));
+        }
 
         // Enter ARMED state and initialize lines around bid/ask; blink toggles to indicate pending confirm step.
         private void Arm(ArmDirection direction)
@@ -878,6 +958,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             blinkBuy = direction == ArmDirection.Long;
             blinkSell = direction == ArmDirection.Short;
             blinkTickCounter = 0;
+            isDraggingEntry = false;
             if (blinkTimer == null)
             {
                 StartBlinkTimer();
@@ -902,6 +983,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             LogDebug("Blink: disarmed -> stop blinking");
             isDraggingStop = false;
             isDraggingTarget = false;
+            isDraggingEntry = false;
             if (removeLines)
                 RemoveAllDrawObjects();
             UpdateUiState();
@@ -916,11 +998,45 @@ namespace NinjaTrader.NinjaScript.Strategies
             blinkOn = false;
             isDraggingStop = false;
             isDraggingTarget = false;
+            isDraggingEntry = false;
             entryPrice = 0;
             stopPrice = 0;
             targetPrice = 0;
             RemoveAllDrawObjects();
             UpdateUiState();
+        }
+
+        private void ApplyOrderTypeModeToLines()
+        {
+            if (!isArmed && !hasPendingEntry && (Position == null || Position.MarketPosition == MarketPosition.Flat))
+            {
+                if (orderTypeMode == OrderTypeMode.Market)
+                    HideEntryLine();
+                return;
+            }
+
+            double workingEntry = entryPrice;
+            if (orderTypeMode == OrderTypeMode.Market || workingEntry <= 0)
+                workingEntry = RoundToTick(GetEntryReference(armedDirection));
+
+            bool entryClamped = ClampEntryPriceForMode(GetWorkingDirection(), ref workingEntry);
+            entryPrice = workingEntry;
+
+            if (orderTypeMode == OrderTypeMode.Market)
+            {
+                HideEntryLine();
+                entryLineDirty = false;
+            }
+            else
+            {
+                entryLineDirty = true;
+            }
+
+            if (entryClamped)
+                LogClampOnce("Entry line clamped to stay off-market");
+
+            ApplyLineUpdates();
+            UpdateLabelsOnly();
         }
 
         // Seeds entry/SL/TP lines from current bid/ask with default offsets; applies clamps to stay off-market before confirmation.
@@ -932,16 +1048,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             stopPrice = RoundToTick(direction == ArmDirection.Long ? entryPrice - DefaultStopTicks * tick : entryPrice + DefaultStopTicks * tick);
             targetPrice = RoundToTick(direction == ArmDirection.Long ? entryPrice + DefaultTargetTicks * tick : entryPrice - DefaultTargetTicks * tick);
 
+            bool entryClamped = ClampEntryPriceForMode(GetWorkingDirection(), ref entryPrice);
             bool clamped;
             EnforceValidity(GetWorkingDirection(), ref stopPrice, ref targetPrice, out clamped);
 
-            entryLineDirty = true;
+            entryLineDirty = ShouldShowEntryLine();
             stopLineDirty = true;
             targetLineDirty = true;
+            if (!entryLineDirty)
+                HideEntryLine();
             ApplyLineUpdates();
             UpdateLabelsOnly();
 
-            if (clamped)
+            if (clamped || entryClamped)
                 LogClampOnce("Default lines clamped to stay off-market");
         }
 
@@ -951,12 +1070,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!isArmed || armedDirection == ArmDirection.None)
                 return;
 
+            if (orderTypeMode != OrderTypeMode.Market)
+                return;
+
+            if (isDraggingEntry)
+                return;
+
             double refPrice = GetEntryReference(armedDirection);
             double newEntry = RoundToTick(refPrice);
             if (Math.Abs(newEntry - entryPrice) > TickSize() / 4)
             {
                 entryPrice = newEntry;
-                entryLineDirty = true;
+                entryLineDirty = ShouldShowEntryLine();
             }
         }
 
@@ -1027,10 +1152,44 @@ namespace NinjaTrader.NinjaScript.Strategies
             UpdateLabelsOnly();
         }
 
+        // Detect user drags on entry line when using stop/limit arming; clamps to valid side of market.
+        private void ProcessEntryLineDrag()
+        {
+            if (!ShouldShowEntryLine() || orderTypeMode == OrderTypeMode.Market || entryLine == null || suppressLineEvents)
+                return;
+
+            double? candidate = GetLinePrice(entryLine);
+            if (candidate == null)
+                return;
+
+            double snapped = RoundToTick(candidate.Value);
+            if (Math.Abs(snapped - entryPrice) < TickSize() / 4)
+                return;
+
+            if (!isDraggingEntry)
+            {
+                isDraggingEntry = true;
+                LogDebugDrag("DragStart ENTRY at", snapped);
+            }
+
+            entryPrice = snapped;
+            bool clamped = ClampEntryPriceForMode(GetWorkingDirection(), ref entryPrice);
+            SetLinePrice(entryLine, entryPrice);
+            if (clamped)
+                LogClampOnce("Entry line clamped to stay off-market");
+            entryLineDirty = false;
+            UpdateLabelsOnly();
+        }
+
         // Snap entry price to tick and mirror HUD label; used on fills and ARMED updates.
         private void UpdateEntryLine(double price, string reason)
         {
             entryPrice = RoundToTick(price);
+            if (!ShouldShowEntryLine())
+            {
+                HideEntryLine();
+                return;
+            }
             CreateOrUpdateEntryLine(entryPrice, $"{GetQtyLabel()} ({reason})");
         }
 
@@ -1047,7 +1206,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (entryLine != null)
                     {
                         entryLine.Stroke = new Stroke(Brushes.Black, DashStyleHelper.Solid, 2);
-                        entryLine.IsLocked = true;
+                        entryLine.IsLocked = orderTypeMode == OrderTypeMode.Market;
                         TrackDrawObject(entryLine);
                     }
                 }
@@ -1055,6 +1214,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     SetLinePrice(entryLine, price);
                 }
+                if (entryLine != null)
+                    entryLine.IsLocked = orderTypeMode == OrderTypeMode.Market;
                 CreateOrUpdateLabel(EntryLabelTag, price, label, Brushes.Black);
             }
             finally
@@ -1147,6 +1308,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 LogClampOnce("Lines clamped before entry to avoid immediate triggers");
             }
 
+            if (orderTypeMode == OrderTypeMode.Market)
+                entryPrice = RoundToTick(GetEntryReference(armedDirection));
+
+            bool entryClamped = false;
+            if (orderTypeMode != OrderTypeMode.Market)
+            {
+                entryClamped = ClampEntryPriceForMode(GetWorkingDirection(), ref entryPrice);
+                if (entryClamped)
+                    entryLineDirty = true;
+            }
+
             int qty = CalculateQuantity();
             if (qty < 1)
             {
@@ -1158,10 +1330,29 @@ namespace NinjaTrader.NinjaScript.Strategies
             OrderAction stopAction = armedDirection == ArmDirection.Long ? OrderAction.Sell : OrderAction.BuyToCover;
             OrderAction targetAction = stopAction;
             string entryName = armedDirection == ArmDirection.Long ? EntrySignalLong : EntrySignalShort;
+            OrderType entryOrderType;
+            double entryLimitPrice = 0;
+            double entryStopPrice = 0;
+
+            switch (orderTypeMode)
+            {
+                case OrderTypeMode.Stop:
+                    entryOrderType = OrderType.StopMarket;
+                    entryStopPrice = entryPrice;
+                    break;
+                case OrderTypeMode.Limit:
+                    entryOrderType = OrderType.Limit;
+                    entryLimitPrice = entryPrice;
+                    break;
+                case OrderTypeMode.Market:
+                default:
+                    entryOrderType = OrderType.Market;
+                    break;
+            }
 
             SafeExecute("SubmitOrders", () =>
             {
-                entryOrder = SubmitOrderUnmanaged(0, entryAction, OrderType.Market, qty, 0, 0, null, entryName);
+                entryOrder = SubmitOrderUnmanaged(0, entryAction, entryOrderType, qty, entryLimitPrice, entryStopPrice, null, entryName);
                 currentOco = Guid.NewGuid().ToString("N");
                 stopOrder = SubmitOrderUnmanaged(0, stopAction, OrderType.StopMarket, qty, 0, stopPrice, currentOco, StopSignal);
                 targetOrder = SubmitOrderUnmanaged(0, targetAction, OrderType.Limit, qty, targetPrice, 0, currentOco, TargetSignal);
@@ -1171,7 +1362,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             hasPendingEntry = true;
             UpdateUiState();
             string side = entryAction == OrderAction.Buy ? "BUY" : "SELL SHORT";
-            LogInfo($"{side} entry submitted: qty {qty}, SL {stopPrice:F2}, TP {targetPrice:F2}");
+            string entryDescriptor = entryOrderType == OrderType.Market
+                ? "MARKET"
+                : $"{GetOrderTypeLabel(orderTypeMode)} @ {entryPrice:F2}";
+            LogInfo($"{side} entry submitted ({entryDescriptor}): qty {qty}, SL {stopPrice:F2}, TP {targetPrice:F2}");
+            if (entryClamped)
+                LogClampOnce("Entry line clamped before submission");
             ApplyLineUpdates();
             UpdateLabelsOnly();
             SetMilestone("ConfirmEntry-End");
@@ -1434,6 +1630,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (Position != null && Position.MarketPosition != MarketPosition.Flat && Position.Quantity != 0)
                 return Position.AveragePrice;
 
+            if (orderTypeMode != OrderTypeMode.Market && (isArmed || hasPendingEntry))
+                return entryPrice;
+
             if (isArmed)
                 return GetEntryReference(armedDirection);
 
@@ -1464,9 +1663,19 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void ApplyLineUpdates()
         {
             // Only move lines when their tracked price changed; avoids ticking redraws that used to override user drags.
-            if (entryLineDirty)
+            bool showEntry = ShouldShowEntryLine();
+            if (showEntry)
             {
-                CreateOrUpdateEntryLine(entryPrice, GetQtyLabel());
+                if (entryLineDirty && !isDraggingEntry)
+                {
+                    CreateOrUpdateEntryLine(entryPrice, GetQtyLabel());
+                    entryLineDirty = false;
+                }
+            }
+            else
+            {
+                if (entryLine != null || lastEntryLabel != null)
+                    HideEntryLine();
                 entryLineDirty = false;
             }
 
@@ -1489,14 +1698,25 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!HasActiveLines())
                 return;
 
-            string entryLabel = GetEntryLabelSafe();
             string stopLbl = GetStopLabel();
             string targetLbl = GetTargetLabel();
 
-            if (entryLabel != lastEntryLabel)
+            if (ShouldShowEntryLine())
             {
-                CreateOrUpdateLabel(EntryLabelTag, entryPrice, entryLabel, Brushes.Black);
-                lastEntryLabel = entryLabel;
+                string entryLabel = GetEntryLabelSafe();
+                if (entryLabel != lastEntryLabel)
+                {
+                    CreateOrUpdateLabel(EntryLabelTag, entryPrice, entryLabel, Brushes.Black);
+                    lastEntryLabel = entryLabel;
+                }
+            }
+            else
+            {
+                if (lastEntryLabel != null)
+                {
+                    TryRemoveDrawObject(EntryLabelTag);
+                    lastEntryLabel = null;
+                }
             }
 
             if (stopLbl != lastStopLabel)
@@ -1563,7 +1783,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return label;
         }
 
-        // Stop label displays currency risk and distance; warns when over MaxRiskWarningUSD threshold.
+        // Stop label displays currency risk and distance; warns when over FixedRiskUSD threshold.
         private string GetStopLabel()
         {
             if (!TryComputeSizing(out double tick, out double tickValue, out double entryRef, out string reason))
@@ -1586,14 +1806,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             string distanceText = FormatPointsAndTicks(stopDistanceTicks);
             string label = $"SL: -{CurrencySymbol()}{totalRisk:F2} ({distanceText})";
             // Legacy templates carried a 200 default warning; if user raised FixedRiskUSD above that, treat 200 as legacy and follow FixedRiskUSD instead.
-            const double legacyWarn = 200d;
-            double effectiveWarn = MaxRiskWarningUSD > 0 ? MaxRiskWarningUSD : FixedRiskUSD;
-            if (MaxRiskWarningUSD > 0
-                && Math.Abs(MaxRiskWarningUSD - legacyWarn) < 0.0001
-                && Math.Abs(FixedRiskUSD - legacyWarn) > 0.0001)
-            {
-                effectiveWarn = FixedRiskUSD;
-            }
+            double effectiveWarn = FixedRiskUSD;
             if (LogLevelSetting == LogLevelOption.Debug && ShouldLogDebug())
                 LogDebug($"StopWarn eval: stopTicks={stopDistanceTicks:F1} tickValue={tickValue:F4} displayQty={riskQty} totalRisk={totalRisk:F2} warn={effectiveWarn:F2}");
             if (totalRisk > effectiveWarn)
@@ -1838,6 +2051,75 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        private bool ClampEntryPriceForMode(MarketPosition direction, ref double price)
+        {
+            if (orderTypeMode == OrderTypeMode.Market || direction == MarketPosition.Flat)
+                return false;
+
+            double tick = TickSize();
+            double bid = GetCurrentBid();
+            double ask = GetCurrentAsk();
+            if (bid <= 0)
+                bid = Close[0];
+            if (ask <= 0)
+                ask = Close[0];
+
+            double original = price;
+
+            if (direction == MarketPosition.Long)
+            {
+                if (orderTypeMode == OrderTypeMode.Stop)
+                {
+                    double minStop = ask + tick;
+                    if (price < minStop)
+                        price = RoundToTick(minStop);
+                }
+                else if (orderTypeMode == OrderTypeMode.Limit)
+                {
+                    double maxLimit = bid - tick;
+                    if (price > maxLimit)
+                        price = RoundToTick(maxLimit);
+                }
+            }
+            else if (direction == MarketPosition.Short)
+            {
+                if (orderTypeMode == OrderTypeMode.Stop)
+                {
+                    double maxStop = bid - tick;
+                    if (price > maxStop)
+                        price = RoundToTick(maxStop);
+                }
+                else if (orderTypeMode == OrderTypeMode.Limit)
+                {
+                    double minLimit = ask + tick;
+                    if (price < minLimit)
+                        price = RoundToTick(minLimit);
+                }
+            }
+
+            double threshold = tick > 0 ? tick / 8 : 0.0000001;
+            return Math.Abs(price - original) >= threshold;
+        }
+
+        private void HideEntryLine()
+        {
+            if (entryLine == null && lastEntryLabel == null)
+                return;
+
+            TryRemoveDrawObject(EntryLineTag);
+            TryRemoveDrawObject(EntryLabelTag);
+            trackedDrawObjects.RemoveAll(o =>
+                o != null
+                && o.Tag != null
+                && (string.Equals(o.Tag.ToString(), EntryLineTag, StringComparison.Ordinal)
+                    || string.Equals(o.Tag.ToString(), EntryLabelTag, StringComparison.Ordinal)));
+            entryLine = null;
+            entryLineDirty = false;
+            isDraggingEntry = false;
+            lastEntryLabel = null;
+            cachedEntryLabelText = null;
+        }
+
         // Remove all strategy-owned draw objects and reset caches; used on disarm and cleanup.
         private void RemoveAllDrawObjects()
         {
@@ -1871,6 +2153,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 entryLineDirty = false;
                 stopLineDirty = false;
                 targetLineDirty = false;
+                isDraggingEntry = false;
                 lastEntryLabel = null;
                 lastStopLabel = null;
                 lastTargetLabel = null;
@@ -2100,7 +2383,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void FinalizeDrag()
         {
             SetMilestone("FinalizeDrag-Start");
+            bool hadEntryDrag = isDraggingEntry;
+            bool hadStopDrag = isDraggingStop;
+            bool hadTargetDrag = isDraggingTarget;
             bool didLog = false;
+            if (isDraggingEntry)
+            {
+                LogDebugDrag("DragEnd ENTRY at", entryPrice);
+                didLog = true;
+            }
             if (isDraggingStop)
             {
                 LogDebugDrag("DragEnd SL at", stopPrice);
@@ -2110,6 +2401,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 LogDebugDrag("DragEnd TP at", targetPrice);
                 didLog = true;
+            }
+
+            bool entryClamped = false;
+            if (isDraggingEntry && entryLine != null)
+            {
+                entryClamped = ClampEntryPriceForMode(GetWorkingDirection(), ref entryPrice);
+                SetLinePrice(entryLine, entryPrice);
+                entryLineDirty = false;
+                if (entryClamped)
+                    LogClampOnce("Entry line clamped at drag end");
             }
 
             if (isDraggingStop || isDraggingTarget)
@@ -2136,6 +2437,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 UpdateLabelsOnly();
             }
 
+            if (!hadStopDrag && !hadTargetDrag && hadEntryDrag)
+                UpdateLabelsOnly();
+
+            isDraggingEntry = false;
             isDraggingStop = false;
             isDraggingTarget = false;
             SetMilestone("FinalizeDrag-End");
@@ -2234,6 +2539,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if ((now - lastDragMoveLogStop).TotalMilliseconds < 200)
                     return;
                 lastDragMoveLogStop = now;
+            }
+            else if (prefix.Contains("ENTRY"))
+            {
+                if ((now - lastDragMoveLogEntry).TotalMilliseconds < 200)
+                    return;
+                lastDragMoveLogEntry = now;
             }
             else
             {
