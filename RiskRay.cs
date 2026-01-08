@@ -267,7 +267,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 IncludeCommission = false;
                 fatalError = false;
                 fatalErrorMessage = null;
-                MaxRiskWarningUSD = 200;
+                MaxRiskWarningUSD = 0;
                 LabelOffsetTicks = 2;
                 LabelOffsetPixels = 14;
                 LabelBarsRightOffset = 25;
@@ -1579,7 +1579,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             double totalRisk = perContractRisk * riskQty;
             string distanceText = FormatPointsAndTicks(stopDistanceTicks);
             string label = $"SL: -{CurrencySymbol()}{totalRisk:F2} ({distanceText})";
-            if (totalRisk > MaxRiskWarningUSD)
+            // Legacy templates carried a 200 default warning; if user raised FixedRiskUSD above that, treat 200 as legacy and follow FixedRiskUSD instead.
+            const double legacyWarn = 200d;
+            double effectiveWarn = MaxRiskWarningUSD > 0 ? MaxRiskWarningUSD : FixedRiskUSD;
+            if (MaxRiskWarningUSD > 0
+                && Math.Abs(MaxRiskWarningUSD - legacyWarn) < 0.0001
+                && Math.Abs(FixedRiskUSD - legacyWarn) > 0.0001)
+            {
+                effectiveWarn = FixedRiskUSD;
+            }
+            if (LogLevelSetting == LogLevelOption.Debug && ShouldLogDebug())
+                LogDebug($"StopWarn eval: stopTicks={stopDistanceTicks:F1} tickValue={tickValue:F4} displayQty={riskQty} totalRisk={totalRisk:F2} warn={effectiveWarn:F2}");
+            if (totalRisk > effectiveWarn)
                 label = $"!! {label} !!";
             cachedStopLabelText = label;
             return label;
