@@ -1184,41 +1184,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             OrderAction stopAction = armedDirection == ArmDirection.Long ? OrderAction.Sell : OrderAction.BuyToCover;
             OrderAction targetAction = stopAction;
             string entryName = armedDirection == ArmDirection.Long ? tags.EntrySignalLong : tags.EntrySignalShort;
-            double safetyTick = sizing.TickSize();
-            int safetyQty = sizing.CalculateQuantity(entryPrice, stopPrice, FixedRiskUSD, CommissionMode == CommissionModeOption.On, CommissionPerContractRoundTurn, MaxContracts);
-            double stopDistanceTicks = (safetyTick > 0 && !double.IsNaN(safetyTick) && !double.IsInfinity(safetyTick))
-                ? Math.Abs(entryPrice - stopPrice) / safetyTick
-                : double.NaN;
-            double targetDistanceTicks = (safetyTick > 0 && !double.IsNaN(safetyTick) && !double.IsInfinity(safetyTick))
-                ? Math.Abs(targetPrice - entryPrice) / safetyTick
-                : double.NaN;
-            double stopTargetDistance = Math.Abs(stopPrice - targetPrice);
-            var unsafeReasons = new List<string>();
-
-            if (safetyTick <= 0 || double.IsNaN(safetyTick) || double.IsInfinity(safetyTick))
-                unsafeReasons.Add("tick invalid");
-            if (safetyQty < 1)
-                unsafeReasons.Add("qty < 1");
-            if (safetyQty > MaxContracts)
-                unsafeReasons.Add("qty > MaxContracts");
-            if (stopPrice == 0 || double.IsNaN(stopPrice) || double.IsInfinity(stopPrice))
-                unsafeReasons.Add("stopPrice invalid");
-            if (targetPrice == 0 || double.IsNaN(targetPrice) || double.IsInfinity(targetPrice))
-                unsafeReasons.Add("targetPrice invalid");
-            if (double.IsNaN(stopDistanceTicks) || double.IsInfinity(stopDistanceTicks) || stopDistanceTicks < 1)
-                unsafeReasons.Add("stopDistanceTicks < 1");
-            if (!(double.IsNaN(safetyTick) || double.IsInfinity(safetyTick)) && safetyTick > 0 && stopTargetDistance < safetyTick)
-                unsafeReasons.Add("SL/TP overlap (<1 tick)");
-
-            if (unsafeReasons.Count > 0)
-            {
-                string reason = string.Join("; ", unsafeReasons);
-                Print($"{Prefix("FATAL")} Unsafe trade blocked: {reason} | entry={entryPrice:F2} stop={stopPrice:F2} target={targetPrice:F2} tick={safetyTick:F8} qty={safetyQty} stopTicks={stopDistanceTicks:F4} targetTicks={targetDistanceTicks:F4} stopTargetDist={stopTargetDistance:F8} prefixRaw='{(OrderTagPrefix ?? "<null>")}' prefixNorm='{NormalizedPrefix()}'");
-                ShowNotification("RiskRay - Unsafe Trade Blocked", $"Order blocked: {reason}");
-                return;
-            }
-
-            qty = safetyQty;
 
             SafeExecute("SubmitOrders", () =>
             {
@@ -1241,6 +1206,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // CLOSE flow: cancels working entry/exit orders, flattens position, and clears HUD/arming state.
         private void ResetAndFlatten(string reason)
         {
+            EnsureHelpers();
             SetMilestone("ResetAndFlatten-Start");
             LogInfo("CLOSE pressed -> cancel orders + flatten + UI reset");
 
@@ -2304,7 +2270,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if ((DateTime.Now - lastHudMessageTime).TotalSeconds < 0.5)
                     return;
                 lastHudMessageTime = DateTime.Now;
-                var note = Draw.TextFixed(this, tags.Tag("HUD_NOTIFY"), $"{title}: {message}", TextPosition.TopRight, Brushes.White, new SimpleFont("Segoe UI", 13), Brushes.Black, Brushes.White, 4, DashStyleHelper.Solid, 1, false, null);
+                var note = Draw.TextFixed(this, tags.HudNotifyTag, $"{title}: {message}", TextPosition.TopRight, Brushes.White, new SimpleFont("Segoe UI", 13), Brushes.Black, Brushes.White, 4, DashStyleHelper.Solid, 1, false, null);
                 if (note != null)
                     TrackDrawObject(note);
                 return;
@@ -2574,100 +2540,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return "¥";
                 default:
                     return "$";
-            }
-        }
-
-        // Nested helper types keep this script self-contained for NinjaTrader single-file compile mode.
-        private sealed class RiskRayTagNames
-        {
-            private readonly string prefix;
-
-            public RiskRayTagNames(string orderTagPrefix)
-            {
-                string normalized = string.IsNullOrWhiteSpace(orderTagPrefix) ? "RR_" : orderTagPrefix.Trim();
-                prefix = string.IsNullOrWhiteSpace(normalized) ? "RR_" : normalized;
-            }
-
-            public string Tag(string suffix) => $"{prefix}{suffix}";
-
-            public string EntryLineTag => Tag("ENTRY_LINE");
-            public string StopLineTag => Tag("STOP_LINE");
-            public string TargetLineTag => Tag("TARGET_LINE");
-            public string EntryLabelTag => Tag("ENTRY_LABEL");
-            public string StopLabelTag => Tag("STOP_LABEL");
-            public string TargetLabelTag => Tag("TARGET_LABEL");
-
-            public string EntrySignalLong => Tag("ENTRY_LONG");
-            public string EntrySignalShort => Tag("ENTRY_SHORT");
-            public string StopSignal => Tag("SL");
-            public string TargetSignal => Tag("TP");
-            public string CloseSignal => Tag("CLOSE");
-            public string BeSignal => Tag("BE");
-            public string TrailSignal => Tag("TRAIL");
-        }
-
-        private sealed class RiskRaySizing
-        {
-            private readonly Func<Instrument> instrumentProvider;
-            private readonly Func<double> cachedTickGetter;
-            private readonly Action<double> cachedTickSetter;
-
-            public RiskRaySizing(Func<Instrument> instrumentProvider, Func<double> cachedTickGetter, Action<double> cachedTickSetter)
-            {
-                this.instrumentProvider = instrumentProvider;
-                this.cachedTickGetter = cachedTickGetter;
-                this.cachedTickSetter = cachedTickSetter;
-            }
-
-            public double TickSize()
-            {
-                Instrument instrument = instrumentProvider?.Invoke();
-                if (instrument != null && instrument.MasterInstrument != null)
-                {
-                    double tick = instrument.MasterInstrument.TickSize;
-                    if (tick > 0)
-                        cachedTickSetter?.Invoke(tick);
-                    return tick;
-                }
-
-                double cachedTick = cachedTickGetter != null ? cachedTickGetter() : 0;
-                return cachedTick > 0 ? cachedTick : 0.01;
-            }
-
-            public double TickValue()
-            {
-                Instrument instrument = instrumentProvider?.Invoke();
-                return TickSize() * (instrument?.MasterInstrument?.PointValue ?? 1);
-            }
-
-            public double RoundToTick(double price)
-            {
-                Instrument instrument = instrumentProvider?.Invoke();
-                if (instrument != null && instrument.MasterInstrument != null)
-                    return instrument.MasterInstrument.RoundToTickSize(price);
-
-                double cachedTick = cachedTickGetter != null ? cachedTickGetter() : 0;
-                if (cachedTick > 0)
-                    return Math.Round(price / cachedTick) * cachedTick;
-
-                return price;
-            }
-
-            public int CalculateQuantity(double entryPrice, double stopPrice, double fixedRiskUsd, bool commissionOn, double commissionPerContractRoundTurn, int maxContracts)
-            {
-                double tick = TickSize();
-                double distanceTicks = Math.Abs(entryPrice - stopPrice) / tick;
-                if (distanceTicks <= 0)
-                    return 0;
-
-                double perContractRisk = distanceTicks * TickValue();
-                if (commissionOn)
-                    perContractRisk += commissionPerContractRoundTurn;
-
-                double rawQty = perContractRisk > 0 ? fixedRiskUsd / perContractRisk : 0;
-                int qty = (int)Math.Floor(rawQty + 0.5);
-                qty = Math.Min(qty, maxContracts);
-                return qty;
             }
         }
 

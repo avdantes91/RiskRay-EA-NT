@@ -8,7 +8,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         public RiskRayTagNames(string orderTagPrefix)
         {
-            prefix = string.IsNullOrWhiteSpace(orderTagPrefix) ? "RR_" : orderTagPrefix;
+            string normalized = string.IsNullOrWhiteSpace(orderTagPrefix) ? "RR_" : orderTagPrefix.Trim();
+            prefix = string.IsNullOrWhiteSpace(normalized) ? "RR_" : normalized;
         }
 
         public string Tag(string suffix)
@@ -31,5 +32,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         public string CloseSignal => Tag("CLOSE");
         public string BeSignal => Tag("BE");
         public string TrailSignal => Tag("TRAIL");
+        public string HudNotifyTag => Tag("HUD_NOTIFY");
     }
 }
