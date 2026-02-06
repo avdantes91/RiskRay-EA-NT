@@ -25,7 +25,337 @@ using NinjaTrader.NinjaScript.DrawingTools;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
-    public class RiskRay : Strategy
+    public interface IRiskRayPanelHost
+    {
+        ChartControl ChartControl { get; }
+        bool IsArmed { get; }
+        bool IsArmedLong { get; }
+        bool IsArmedShort { get; }
+        bool HasPosition { get; }
+        bool HasPendingEntry { get; }
+        bool HasStopOrder { get; }
+        bool HasTargetOrder { get; }
+        bool DebugBlinkEnabled { get; }
+
+        void ArmLong();
+        void ArmShort();
+        void Confirm();
+        void Close();
+        void BreakEven();
+        void Trail();
+
+        void UiInvoke(Action action);
+        void UiBeginInvoke(Action action);
+        void SafeExecute(string context, Action action);
+        void SetMilestone(string marker);
+        void LogInfo(string message);
+        void LogDebug(string message);
+        void LogUiError(string context, Exception ex);
+        void Print(string message);
+        string Prefix(string level = null);
+        bool ShouldLogDebugBlink();
+    }
+
+    internal sealed class RiskRayPanel
+    {
+        private readonly IRiskRayPanelHost host;
+        private Grid uiRoot;
+        private Button buyButton;
+        private Button sellButton;
+        private Button closeButton;
+        private Button beButton;
+        private Button trailButton;
+        private Grid chartGrid;
+        private bool uiLoaded;
+        private DispatcherTimer blinkTimer;
+        private EventHandler blinkTickHandler;
+        private bool blinkOn;
+        private bool blinkBuy;
+        private bool blinkSell;
+        private int blinkTickCounter;
+        private RoutedEventHandler buyClickHandler;
+        private RoutedEventHandler sellClickHandler;
+        private RoutedEventHandler closeClickHandler;
+        private RoutedEventHandler beClickHandler;
+        private RoutedEventHandler trailClickHandler;
+
+        public RiskRayPanel(IRiskRayPanelHost host)
+        {
+            this.host = host;
+        }
+
+        public bool IsBlinkTimerRunning => blinkTimer != null;
+
+        public void BuildUi()
+        {
+            if (host.ChartControl == null || uiLoaded)
+                return;
+
+            host.SetMilestone("BuildUi-Start");
+            host.UiBeginInvoke(() =>
+            {
+                host.SafeExecute("BuildUi.Dispatcher", () =>
+                {
+                    if (uiLoaded)
+                        return;
+
+                    chartGrid = host.ChartControl.Parent as Grid;
+                    if (chartGrid == null)
+                        return;
+
+                    uiRoot = new Grid
+                    {
+                        HorizontalAlignment = HorizontalAlignment.Left,
+                        VerticalAlignment = VerticalAlignment.Top,
+                        Margin = new Thickness(8),
+                        Background = Brushes.Transparent
+                    };
+
+                    uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                    uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                    uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                    uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                    uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+                    buyClickHandler = (s, e) => host.ArmLong();
+                    sellClickHandler = (s, e) => host.ArmShort();
+                    closeClickHandler = (s, e) => host.Close();
+                    beClickHandler = (s, e) => host.BreakEven();
+                    trailClickHandler = (s, e) => host.Trail();
+
+                    buyButton = CreateButton("BUY", Brushes.DarkGreen, buyClickHandler);
+                    sellButton = CreateButton("SELL", Brushes.DarkRed, sellClickHandler);
+                    closeButton = CreateButton("CLOSE", Brushes.DimGray, closeClickHandler);
+                    beButton = CreateButton("BE", Brushes.DarkSlateBlue, beClickHandler);
+                    trailButton = CreateButton("TRAIL", Brushes.DarkOrange, trailClickHandler);
+
+                    uiRoot.Children.Add(buyButton);
+                    uiRoot.Children.Add(sellButton);
+                    uiRoot.Children.Add(closeButton);
+                    uiRoot.Children.Add(beButton);
+                    uiRoot.Children.Add(trailButton);
+                    Grid.SetColumn(buyButton, 0);
+                    Grid.SetColumn(sellButton, 1);
+                    Grid.SetColumn(closeButton, 2);
+                    Grid.SetColumn(beButton, 3);
+                    Grid.SetColumn(trailButton, 4);
+
+                    chartGrid.Children.Add(uiRoot);
+                    uiLoaded = true;
+                    UpdateUiState();
+                    host.SetMilestone("BuildUi-End");
+                });
+            });
+        }
+
+        private Button CreateButton(string content, Brush baseBrush, RoutedEventHandler handler)
+        {
+            var button = new Button
+            {
+                Content = content,
+                Margin = new Thickness(2),
+                Padding = new Thickness(10, 6, 10, 6),
+                Background = baseBrush,
+                Foreground = Brushes.White,
+                BorderBrush = Brushes.Black,
+                FontWeight = FontWeights.SemiBold,
+                Cursor = System.Windows.Input.Cursors.Hand
+            };
+            button.Click += handler;
+            return button;
+        }
+
+        public void DisposeUi(bool forceSync = false)
+        {
+            if (!uiLoaded)
+                return;
+
+            host.SetMilestone("DisposeUi-Start");
+            if (host.ChartControl == null || host.ChartControl.Dispatcher == null || host.ChartControl.Dispatcher.HasShutdownStarted)
+            {
+                ReleaseUiReferencesNoDispatcher();
+                host.SetMilestone("DisposeUi-End");
+                return;
+            }
+
+            Action disposer = () =>
+            {
+                if (uiRoot != null && chartGrid != null)
+                {
+                    try
+                    {
+                        if (chartGrid.Children.Contains(uiRoot))
+                            chartGrid.Children.Remove(uiRoot);
+                    }
+                    catch (Exception ex)
+                    {
+                        host.LogUiError("DisposeUi.Remove", ex);
+                    }
+                }
+
+                if (buyButton != null && buyClickHandler != null)
+                    buyButton.Click -= buyClickHandler;
+                if (sellButton != null && sellClickHandler != null)
+                    sellButton.Click -= sellClickHandler;
+                if (closeButton != null && closeClickHandler != null)
+                    closeButton.Click -= closeClickHandler;
+                if (beButton != null && beClickHandler != null)
+                    beButton.Click -= beClickHandler;
+                if (trailButton != null && trailClickHandler != null)
+                    trailButton.Click -= trailClickHandler;
+
+                uiRoot = null;
+                buyButton = null;
+                sellButton = null;
+                closeButton = null;
+                beButton = null;
+                trailButton = null;
+                chartGrid = null;
+                uiLoaded = false;
+                host.LogInfo("UI disposed");
+                host.SetMilestone("DisposeUi-End");
+            };
+
+            if (forceSync)
+                host.UiInvoke(disposer);
+            else
+                host.UiBeginInvoke(disposer);
+        }
+
+        public void ReleaseUiReferencesNoDispatcher()
+        {
+            buyButton = null;
+            sellButton = null;
+            closeButton = null;
+            beButton = null;
+            trailButton = null;
+            uiRoot = null;
+            chartGrid = null;
+            uiLoaded = false;
+        }
+
+        public void UpdateUiState()
+        {
+            if (host.ChartControl == null || !uiLoaded)
+                return;
+
+            host.UiBeginInvoke(() =>
+            {
+                if (buyButton != null)
+                    buyButton.Opacity = blinkBuy ? (blinkOn ? 1 : 0.55) : 1;
+                if (sellButton != null)
+                    sellButton.Opacity = blinkSell ? (blinkOn ? 1 : 0.55) : 1;
+                if (host.ShouldLogDebugBlink())
+                    host.Print($"{host.Prefix("DEBUG")} UpdateUiState: blinkBuy={blinkBuy} blinkSell={blinkSell} phase={(blinkOn ? "on" : "off")}");
+                if (closeButton != null)
+                {
+                    closeButton.IsEnabled = host.IsArmed || host.HasPosition || host.HasPendingEntry;
+                    closeButton.IsHitTestVisible = true;
+                }
+                if (trailButton != null)
+                {
+                    trailButton.IsEnabled = host.HasPosition && host.HasStopOrder;
+                    trailButton.IsHitTestVisible = true;
+                }
+                if (beButton != null)
+                    beButton.IsEnabled = host.HasPosition && host.HasStopOrder;
+
+                UpdateArmButtonsUI();
+            });
+        }
+
+        private void UpdateArmButtonsUI()
+        {
+            if (host.ChartControl == null || !uiLoaded)
+                return;
+
+            host.UiBeginInvoke(() =>
+            {
+                blinkBuy = host.IsArmedLong;
+                blinkSell = host.IsArmedShort;
+                if (host.ShouldLogDebugBlink())
+                    host.Print($"{host.Prefix("DEBUG")} UpdateArmButtonsUI: blinkBuy={blinkBuy} blinkSell={blinkSell} phase={(blinkOn ? "on" : "off")} btnNull buy:{buyButton == null} sell:{sellButton == null}");
+                if (buyButton != null)
+                    buyButton.Content = host.IsArmedLong ? "BUY ARMED" : "BUY";
+                if (sellButton != null)
+                    sellButton.Content = host.IsArmedShort ? "SELL ARMED" : "SELL";
+                if (buyButton != null)
+                    buyButton.Opacity = blinkBuy ? (blinkOn ? 1 : 0.55) : 1;
+                if (sellButton != null)
+                    sellButton.Opacity = blinkSell ? (blinkOn ? 1 : 0.55) : 1;
+            });
+        }
+
+        public void StartBlinkTimer()
+        {
+            host.UiInvoke(() =>
+            {
+                if (blinkTimer != null || host.ChartControl == null || host.ChartControl.Dispatcher == null)
+                    return;
+
+                host.SetMilestone("StartBlinkTimer");
+                blinkTimer = new DispatcherTimer(DispatcherPriority.Normal, host.ChartControl.Dispatcher)
+                {
+                    Interval = TimeSpan.FromMilliseconds(500)
+                };
+                blinkTickHandler = (s, e) =>
+                {
+                    blinkTickCounter++;
+                    host.SafeExecute("BlinkTimer", () =>
+                    {
+                        if (!host.IsArmed)
+                            return;
+
+                        blinkOn = !blinkOn;
+                        if (host.DebugBlinkEnabled && blinkTickCounter % 10 == 0)
+                        {
+                            host.Print($"{host.Prefix("DEBUG")} Blink tick #{blinkTickCounter} flags: buy={blinkBuy} sell={blinkSell} phase={(blinkOn ? "on" : "off")} btns null? buy:{buyButton == null} sell:{sellButton == null}");
+                        }
+                        UpdateUiState();
+                    });
+                };
+                blinkTimer.Tick += blinkTickHandler;
+                blinkTimer.Start();
+                host.LogInfo("Blink timer started");
+            });
+        }
+
+        public void StopBlinkTimer()
+        {
+            if (blinkTimer != null && (host.ChartControl == null || host.ChartControl.Dispatcher == null || host.ChartControl.Dispatcher.HasShutdownStarted))
+            {
+                try
+                {
+                    if (blinkTickHandler != null)
+                        blinkTimer.Tick -= blinkTickHandler;
+                    blinkTimer.Stop();
+                }
+                catch (Exception ex)
+                {
+                    host.LogUiError("StopBlinkTimer", ex);
+                }
+                blinkTimer = null;
+                blinkTickHandler = null;
+                return;
+            }
+
+            host.UiInvoke(() =>
+            {
+                if (blinkTimer == null)
+                    return;
+
+                if (blinkTickHandler != null)
+                    blinkTimer.Tick -= blinkTickHandler;
+                blinkTimer.Stop();
+                blinkTimer = null;
+                blinkTickHandler = null;
+                host.SetMilestone("StopBlinkTimer");
+                host.LogInfo("Blink timer stopped");
+            });
+        }
+    }
+
+    public class RiskRay : Strategy, IRiskRayPanelHost
     {
         #region Fields / State
 
@@ -64,16 +394,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             HUD
         }
 
-        // WPF panel controls for manual interaction and blink feedback.
-        private Grid uiRoot;
-        private Button buyButton;
-        private Button sellButton;
-        private Button closeButton;
-        private Button beButton;
-        private Button trailButton;
-        private DispatcherTimer blinkTimer;
-        private EventHandler blinkTickHandler;
-        private bool blinkOn;
+        // WPF panel wrapper for manual interaction and blink feedback.
+        private RiskRayPanel panel;
 
         // ARMED state flags that gate line movement and order submission.
         private ArmDirection armedDirection = ArmDirection.None;
@@ -99,8 +421,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // Chart attachment state and suppression flags used while programmatically moving lines.
         private bool suppressLineEvents;
-        private bool uiLoaded;
-        private Grid chartGrid;
 
         // Cached draw state/labels to prevent leakage and redundant re-renders.
         private readonly HashSet<string> processedExitIds = new HashSet<string>();
@@ -137,13 +457,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Dialog/blink/self-check guards that throttle popups and enforce safety invariants.
         private bool isBeDialogOpen;
         private DateTime lastBeDialogTime = DateTime.MinValue;
-        private bool blinkBuy;
-        private bool blinkSell;
         private bool selfCheckDone;
         private bool selfCheckFailed;
         private string selfCheckReason;
         private bool selfCheckDialogShown;
-        private int blinkTickCounter;
         private DateTime lastUiErrorLogTime = DateTime.MinValue;
         private DateTime lastCleanupLogTime = DateTime.MinValue;
         private bool receivedMarketDataThisSession;
@@ -323,6 +640,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 fatalCount = 0;
                 terminatedCleanupDone = false;
                 terminationSummaryLogged = false;
+                panel = null;
                 bracketIncompleteHandled = false;
                 forceSizingDebugLog = false;
                 lastSizingDebugLogTime = DateTime.MinValue;
@@ -343,6 +661,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 sizing = null;
                 chartLines = null;
                 hud = null;
+                panel = new RiskRayPanel(this);
             }
             else if (State == State.Historical)
             {
@@ -450,14 +769,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void ReleaseUiReferencesNoDispatcher()
         {
             chartEventsAttached = false;
-            buyButton = null;
-            sellButton = null;
-            closeButton = null;
-            beButton = null;
-            trailButton = null;
-            uiRoot = null;
-            chartGrid = null;
-            uiLoaded = false;
+            panel?.ReleaseUiReferencesNoDispatcher();
         }
 
         private void CleanupStateWithoutUi()
@@ -538,7 +850,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     hasPendingEntry = false;
                     armedDirection = ArmDirection.None;
                     isArmed = false;
-                    blinkOn = false;
                     UpdateUiState();
                     UpdateEntryLine(avgEntryPrice, "Entry fill");
                     LogInfo($"Entry filled @ {avgEntryPrice:F2} ({order.Quantity} contracts)");
@@ -705,268 +1016,34 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Create the WPF chart-side button panel once ChartControl is available; must marshal to dispatcher to satisfy NinjaTrader UI thread rules.
         private void BuildUi()
         {
-            if (ChartControl == null || uiLoaded)
-                return;
-
-            SetMilestone("BuildUi-Start");
-            UiBeginInvoke(() =>
-            {
-                SafeExecute("BuildUi.Dispatcher", () =>
-                {
-                    if (uiLoaded)
-                        return;
-
-                    chartGrid = ChartControl.Parent as Grid;
-                    if (chartGrid == null)
-                        return;
-
-                    uiRoot = new Grid
-                    {
-                        HorizontalAlignment = HorizontalAlignment.Left,
-                        VerticalAlignment = VerticalAlignment.Top,
-                        Margin = new Thickness(8),
-                        Background = Brushes.Transparent
-                    };
-
-                    uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-                    uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-                    uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-                    uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-                    uiRoot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-                    buyButton = CreateButton("BUY", Brushes.DarkGreen, OnBuyClicked);
-                    sellButton = CreateButton("SELL", Brushes.DarkRed, OnSellClicked);
-                    closeButton = CreateButton("CLOSE", Brushes.DimGray, OnCloseClicked);
-                    beButton = CreateButton("BE", Brushes.DarkSlateBlue, OnBeClicked);
-                    trailButton = CreateButton("TRAIL", Brushes.DarkOrange, OnTrailClicked);
-
-                    uiRoot.Children.Add(buyButton);
-                    uiRoot.Children.Add(sellButton);
-                    uiRoot.Children.Add(closeButton);
-                    uiRoot.Children.Add(beButton);
-                    uiRoot.Children.Add(trailButton);
-                    Grid.SetColumn(buyButton, 0);
-                    Grid.SetColumn(sellButton, 1);
-                    Grid.SetColumn(closeButton, 2);
-                    Grid.SetColumn(beButton, 3);
-                    Grid.SetColumn(trailButton, 4);
-
-                    chartGrid.Children.Add(uiRoot);
-                    uiLoaded = true;
-                    UpdateUiState();
-                    AttachChartEvents();
-                    SetMilestone("BuildUi-End");
-                });
-            });
-        }
-
-        // Factory for consistent button styling and click hookup for the manual control panel.
-        private Button CreateButton(string content, Brush baseBrush, RoutedEventHandler handler)
-        {
-            var button = new Button
-            {
-                Content = content,
-                Margin = new Thickness(2),
-                Padding = new Thickness(10, 6, 10, 6),
-                Background = baseBrush,
-                Foreground = Brushes.White,
-                BorderBrush = Brushes.Black,
-                FontWeight = FontWeights.SemiBold,
-                Cursor = System.Windows.Input.Cursors.Hand
-            };
-            button.Click += handler;
-            return button;
+            if (panel == null)
+                panel = new RiskRayPanel(this);
+            panel.BuildUi();
         }
 
         // Tear down the WPF panel and detach events on disposal or termination to avoid stale references.
         private void DisposeUi(bool forceSync = false)
         {
-            if (!uiLoaded)
-                return;
-
-            SetMilestone("DisposeUi-Start");
-            if (ChartControl == null || ChartControl.Dispatcher == null || ChartControl.Dispatcher.HasShutdownStarted)
-            {
-                // Fallback cleanup when dispatcher is gone; avoid touching UI elements.
-                buyButton = null;
-                sellButton = null;
-                closeButton = null;
-                beButton = null;
-                trailButton = null;
-                uiRoot = null;
-                chartGrid = null;
-                chartEventsAttached = false;
-                uiLoaded = false;
-                SetMilestone("DisposeUi-End");
-                return;
-            }
-
-            Action disposer = () =>
-            {
-                DetachChartEvents();
-                if (uiRoot != null && chartGrid != null)
-                {
-                    try
-                    {
-                        if (chartGrid.Children.Contains(uiRoot))
-                            chartGrid.Children.Remove(uiRoot);
-                    }
-                    catch (Exception ex)
-                    {
-                        LogUiError("DisposeUi.Remove", ex);
-                    }
-                }
-
-                if (buyButton != null)
-                    buyButton.Click -= OnBuyClicked;
-                if (sellButton != null)
-                    sellButton.Click -= OnSellClicked;
-                if (closeButton != null)
-                    closeButton.Click -= OnCloseClicked;
-                if (beButton != null)
-                    beButton.Click -= OnBeClicked;
-                if (trailButton != null)
-                    trailButton.Click -= OnTrailClicked;
-
-                uiRoot = null;
-                buyButton = null;
-                sellButton = null;
-                closeButton = null;
-                beButton = null;
-                trailButton = null;
-                uiLoaded = false;
-                LogInfo("UI disposed");
-                SetMilestone("DisposeUi-End");
-            };
-
-            if (forceSync)
-                UiInvoke(disposer);
-            else
-                UiBeginInvoke(disposer);
+            panel?.DisposeUi(forceSync);
+            DetachChartEvents();
         }
 
         // Dispatcher-safe UI refresh for opacity/enabled states based on ARMED and position status.
         private void UpdateUiState()
         {
-            if (ChartControl == null || !uiLoaded)
-                return;
-
-            UiBeginInvoke(() =>
-            {
-                if (buyButton != null)
-                    buyButton.Opacity = blinkBuy ? (blinkOn ? 1 : 0.55) : 1;
-                if (sellButton != null)
-                    sellButton.Opacity = blinkSell ? (blinkOn ? 1 : 0.55) : 1;
-                if (ShouldLogDebugBlink())
-                    Print($"{Prefix("DEBUG")} UpdateUiState: blinkBuy={blinkBuy} blinkSell={blinkSell} phase={(blinkOn ? "on" : "off")}");
-                if (closeButton != null)
-                {
-                    closeButton.IsEnabled = isArmed || Position.MarketPosition != MarketPosition.Flat || entryOrder != null;
-                    closeButton.IsHitTestVisible = true;
-                }
-                if (trailButton != null)
-                {
-                    trailButton.IsEnabled = Position.MarketPosition != MarketPosition.Flat && stopOrder != null;
-                    trailButton.IsHitTestVisible = true;
-                }
-                if (beButton != null)
-                    beButton.IsEnabled = Position.MarketPosition != MarketPosition.Flat && stopOrder != null;
-
-                UpdateArmButtonsUI();
-            });
-        }
-
-        // Keeps BUY/SELL button text and blink state aligned with ARMED direction.
-        private void UpdateArmButtonsUI()
-        {
-            if (ChartControl == null || !uiLoaded)
-                return;
-
-            UiBeginInvoke(() =>
-            {
-                blinkBuy = isArmed && armedDirection == ArmDirection.Long;
-                blinkSell = isArmed && armedDirection == ArmDirection.Short;
-                if (ShouldLogDebugBlink())
-                    Print($"{Prefix("DEBUG")} UpdateArmButtonsUI: blinkBuy={blinkBuy} blinkSell={blinkSell} phase={(blinkOn ? "on" : "off")} btnNull buy:{buyButton == null} sell:{sellButton == null}");
-                if (buyButton != null)
-                    buyButton.Content = (isArmed && armedDirection == ArmDirection.Long) ? "BUY ARMED" : "BUY";
-                if (sellButton != null)
-                    sellButton.Content = (isArmed && armedDirection == ArmDirection.Short) ? "SELL ARMED" : "SELL";
-                if (buyButton != null)
-                    buyButton.Opacity = blinkBuy ? (blinkOn ? 1 : 0.55) : 1;
-                if (sellButton != null)
-                    sellButton.Opacity = blinkSell ? (blinkOn ? 1 : 0.55) : 1;
-            });
+            panel?.UpdateUiState();
         }
 
         // Blink timer (500ms) drives visual feedback for ARMED state; must run on chart dispatcher to avoid cross-thread WPF access.
         private void StartBlinkTimer()
         {
-            UiInvoke(() =>
-            {
-                if (blinkTimer != null || ChartControl == null || ChartControl.Dispatcher == null)
-                    return;
-
-                SetMilestone("StartBlinkTimer");
-                blinkTimer = new DispatcherTimer(DispatcherPriority.Normal, ChartControl.Dispatcher)
-                {
-                    Interval = TimeSpan.FromMilliseconds(500)
-                };
-                blinkTickHandler = (s, e) =>
-                {
-                    blinkTickCounter++;
-                    SafeExecute("BlinkTimer", () =>
-                    {
-                        if (!isArmed)
-                            return;
-
-                        blinkOn = !blinkOn;
-                        if (DebugBlink && blinkTickCounter % 10 == 0)
-                        {
-                            Print($"{Prefix("DEBUG")} Blink tick #{blinkTickCounter} flags: buy={blinkBuy} sell={blinkSell} phase={(blinkOn ? "on" : "off")} btns null? buy:{buyButton == null} sell:{sellButton == null}");
-                        }
-                        UpdateUiState();
-                    });
-                };
-                blinkTimer.Tick += blinkTickHandler;
-                blinkTimer.Start();
-                LogInfo("Blink timer started");
-            });
+            panel?.StartBlinkTimer();
         }
 
         // Stop and release blink timer when no longer needed.
         private void StopBlinkTimer()
         {
-            if (blinkTimer != null && (ChartControl == null || ChartControl.Dispatcher == null || ChartControl.Dispatcher.HasShutdownStarted))
-            {
-                try
-                {
-                    if (blinkTickHandler != null)
-                        blinkTimer.Tick -= blinkTickHandler;
-                    blinkTimer.Stop();
-                }
-                catch (Exception ex)
-                {
-                    LogUiError("StopBlinkTimer", ex);
-                }
-                blinkTimer = null;
-                blinkTickHandler = null;
-                return;
-            }
-
-            UiInvoke(() =>
-            {
-                if (blinkTimer == null)
-                    return;
-
-                if (blinkTickHandler != null)
-                    blinkTimer.Tick -= blinkTickHandler;
-                blinkTimer.Stop();
-                blinkTimer = null;
-                blinkTickHandler = null;
-                SetMilestone("StopBlinkTimer");
-                LogInfo("Blink timer stopped");
-            });
+            panel?.StopBlinkTimer();
         }
 
         #endregion
@@ -1081,11 +1158,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             armedDirection = direction;
             isArmed = true;
             hasPendingEntry = false;
-            blinkOn = true;
-            blinkBuy = direction == ArmDirection.Long;
-            blinkSell = direction == ArmDirection.Short;
-            blinkTickCounter = 0;
-            if (blinkTimer == null)
+            if (panel == null || !panel.IsBlinkTimerRunning)
             {
                 StartBlinkTimer();
                 LogDebug("Blink: start timer");
@@ -1102,10 +1175,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             isArmed = false;
             armedDirection = ArmDirection.None;
             hasPendingEntry = false;
-            blinkOn = false;
-            blinkBuy = false;
-            blinkSell = false;
-            blinkTickCounter = 0;
             LogDebug("Blink: disarmed -> stop blinking");
             isDraggingStop = false;
             isDraggingTarget = false;
@@ -2052,6 +2121,34 @@ namespace NinjaTrader.NinjaScript.Strategies
             lastDebugBlinkLogTime = DateTime.Now;
             return true;
         }
+
+        ChartControl IRiskRayPanelHost.ChartControl => ChartControl;
+        bool IRiskRayPanelHost.IsArmed => isArmed;
+        bool IRiskRayPanelHost.IsArmedLong => isArmed && armedDirection == ArmDirection.Long;
+        bool IRiskRayPanelHost.IsArmedShort => isArmed && armedDirection == ArmDirection.Short;
+        bool IRiskRayPanelHost.HasPosition => Position.MarketPosition != MarketPosition.Flat;
+        bool IRiskRayPanelHost.HasPendingEntry => hasPendingEntry || entryOrder != null;
+        bool IRiskRayPanelHost.HasStopOrder => stopOrder != null;
+        bool IRiskRayPanelHost.HasTargetOrder => targetOrder != null;
+        bool IRiskRayPanelHost.DebugBlinkEnabled => DebugBlink;
+
+        void IRiskRayPanelHost.ArmLong() => OnBuyClicked(null, null);
+        void IRiskRayPanelHost.ArmShort() => OnSellClicked(null, null);
+        void IRiskRayPanelHost.Confirm() => TriggerCustomEvent(_ => SafeExecute("ConfirmEntry", ConfirmEntry), null);
+        void IRiskRayPanelHost.Close() => OnCloseClicked(null, null);
+        void IRiskRayPanelHost.BreakEven() => OnBeClicked(null, null);
+        void IRiskRayPanelHost.Trail() => OnTrailClicked(null, null);
+
+        void IRiskRayPanelHost.UiInvoke(Action action) => UiInvoke(action);
+        void IRiskRayPanelHost.UiBeginInvoke(Action action) => UiBeginInvoke(action);
+        void IRiskRayPanelHost.SafeExecute(string context, Action action) => SafeExecute(context, action);
+        void IRiskRayPanelHost.SetMilestone(string marker) => SetMilestone(marker);
+        void IRiskRayPanelHost.LogInfo(string message) => LogInfo(message);
+        void IRiskRayPanelHost.LogDebug(string message) => LogDebug(message);
+        void IRiskRayPanelHost.LogUiError(string context, Exception ex) => LogUiError(context, ex);
+        void IRiskRayPanelHost.Print(string message) => Print(message);
+        string IRiskRayPanelHost.Prefix(string level) => Prefix(level);
+        bool IRiskRayPanelHost.ShouldLogDebugBlink() => ShouldLogDebugBlink();
 
         private void LogLabelRefresh(string lineName, bool textChanged, bool priceMoved, double oldPrice, double newPrice)
         {
