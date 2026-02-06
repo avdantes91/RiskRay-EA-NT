@@ -2,7 +2,7 @@ using System;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
-    public class RiskRayTagNames
+    public sealed class RiskRayTagNames
     {
         private readonly string prefix;
 

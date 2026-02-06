@@ -5,7 +5,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 {
     public sealed class RiskRayHud
     {
-        public readonly struct Snapshot
+        public struct Snapshot
         {
             public Snapshot(
                 double entryPrice,
@@ -72,7 +72,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             cachedRrLabelText = null;
         }
 
-        public string GetEntryLabelSafe(in Snapshot s)
+        public string GetEntryLabelSafe(Snapshot s)
         {
             string qtyLabel = GetQtyLabel(s);
             string rrText = GetRiskRewardText(s);
@@ -87,9 +87,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             return combined;
         }
 
-        public string GetQtyLabel(in Snapshot s)
+        public string GetQtyLabel(Snapshot s)
         {
-            if (!TryComputeSizing(s, out double tick, out double tickValue, out _, out _))
+            double tick;
+            double tickValue;
+            double entryRefUnused;
+            string reasonUnused;
+            if (!TryComputeSizing(s, out tick, out tickValue, out entryRefUnused, out reasonUnused))
                 return UseCachedOrPlaceholder(ref cachedQtyLabelText);
 
             double stopTicks = Math.Abs(s.EntryPrice - s.StopPrice) / tick;
@@ -106,9 +110,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             return label;
         }
 
-        public string GetStopLabel(in Snapshot s)
+        public string GetStopLabel(Snapshot s)
         {
-            if (!TryComputeSizing(s, out double tick, out double tickValue, out double entryRef, out _))
+            double tick;
+            double tickValue;
+            double entryRef;
+            string reasonUnused;
+            if (!TryComputeSizing(s, out tick, out tickValue, out entryRef, out reasonUnused))
                 return UseCachedOrPlaceholder(ref cachedStopLabelText);
 
             double stopDistanceTicks = Math.Abs(entryRef - s.StopPrice) / tick;
@@ -142,9 +150,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             return label;
         }
 
-        public string GetTargetLabel(in Snapshot s)
+        public string GetTargetLabel(Snapshot s)
         {
-            if (!TryComputeSizing(s, out double tick, out double tickValue, out double entryRef, out _))
+            double tick;
+            double tickValue;
+            double entryRef;
+            string reasonUnused;
+            if (!TryComputeSizing(s, out tick, out tickValue, out entryRef, out reasonUnused))
                 return UseCachedOrPlaceholder(ref cachedTargetLabelText);
 
             double rewardTicks = Math.Abs(s.TargetPrice - entryRef) / tick;
@@ -159,9 +171,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             return label;
         }
 
-        public string GetRiskRewardText(in Snapshot s)
+        public string GetRiskRewardText(Snapshot s)
         {
-            if (!TryComputeSizing(s, out double tick, out _, out double entryRef, out _))
+            double tick;
+            double tickValueUnused;
+            double entryRef;
+            string reasonUnused;
+            if (!TryComputeSizing(s, out tick, out tickValueUnused, out entryRef, out reasonUnused))
                 return UseCachedOrPlaceholder(ref cachedRrLabelText);
 
             double stopTicks = Math.Abs(entryRef - s.StopPrice) / tick;
@@ -175,7 +191,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return rrText;
         }
 
-        public bool TryComputeSizing(in Snapshot s, out double tick, out double tickValue, out double entryRef, out string reason)
+        public bool TryComputeSizing(Snapshot s, out double tick, out double tickValue, out double entryRef, out string reason)
         {
             tick = sizing.TickSize();
             tickValue = sizing.TickValue();

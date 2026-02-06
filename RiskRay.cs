@@ -19,6 +19,7 @@ using NinjaTrader.Gui;
 using NinjaTrader.Gui.Chart;
 using NinjaTrader.Gui.Tools;
 using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
@@ -117,11 +118,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string fatalErrorMessage;
         private bool isDraggingStop;
         private bool isDraggingTarget;
+        private bool dragFinalizePending;
         private int finalizeDragInProgress;
         private DateTime lastFinalizeDragTimeUtc = DateTime.MinValue;
         private const int FinalizeDragDuplicateSuppressMs = 100;
         private DateTime lastDragMoveLogStop = DateTime.MinValue;
         private DateTime lastDragMoveLogTarget = DateTime.MinValue;
+        private DateTime lastMouseDragPulseUtc = DateTime.MinValue;
+        private const int MouseDragPulseThrottleMs = 20;
         private DateTime lastLabelRefreshLogTime = DateTime.MinValue;
         private bool chartEventsAttached;
         // Dialog/blink/self-check guards that throttle popups and enforce safety invariants.
@@ -146,6 +150,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         private readonly string instanceId = Guid.NewGuid().ToString("N").Substring(0, 6);
         private int stateChangeSeq = 0;
         private bool isRunningInstance;
+        private bool userAdjustedStopWhileArmed;
+        private bool userAdjustedTargetWhileArmed;
+        private double armedStopOffsetTicks;
+        private double armedTargetOffsetTicks;
         private RiskRayTagNames tags;
         private RiskRaySizing sizing;
         private RiskRayChartLines chartLines;
@@ -291,6 +299,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastMilestone = null;
                 lastMilestoneTime = DateTime.MinValue;
                 fatalCount = 0;
+                userAdjustedStopWhileArmed = false;
+                userAdjustedTargetWhileArmed = false;
+                armedStopOffsetTicks = 0;
+                armedTargetOffsetTicks = 0;
+                dragFinalizePending = false;
             }
             else if (State == State.Configure)
             {
@@ -403,9 +416,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 receivedMarketDataThisSession = true;
 
-                UpdateEntryLineFromMarket();
                 ProcessLineDrag(RiskRayChartLines.LineKind.Stop, ref stopPrice, true);
                 ProcessLineDrag(RiskRayChartLines.LineKind.Target, ref targetPrice, false);
+                UpdateEntryLineFromMarket();
                 ApplyLineUpdates();
                 UpdateLabelsOnly();
             }
@@ -914,6 +927,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             LogDebug("Blink: disarmed -> stop blinking");
             isDraggingStop = false;
             isDraggingTarget = false;
+            dragFinalizePending = false;
+            userAdjustedStopWhileArmed = false;
+            userAdjustedTargetWhileArmed = false;
+            armedStopOffsetTicks = 0;
+            armedTargetOffsetTicks = 0;
             ResetLabelTrackingCaches();
             if (removeLines)
             {
@@ -944,6 +962,20 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool clamped;
             EnforceValidity(GetWorkingDirection(), ref stopPrice, ref targetPrice, out clamped);
 
+            if (tick > 0)
+            {
+                armedStopOffsetTicks = (stopPrice - entryPrice) / tick;
+                armedTargetOffsetTicks = (targetPrice - entryPrice) / tick;
+            }
+            else
+            {
+                armedStopOffsetTicks = 0;
+                armedTargetOffsetTicks = 0;
+            }
+            userAdjustedStopWhileArmed = false;
+            userAdjustedTargetWhileArmed = false;
+            LogDebug($"ARM offsets init: stop={armedStopOffsetTicks:F1}t, target={armedTargetOffsetTicks:F1}t");
+
             entryLineDirty = true;
             stopLineDirty = true;
             targetLineDirty = true;
@@ -960,23 +992,139 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Entry line follows live bid/ask while ARMED so user always confirms at current market-relative level.
         private void UpdateEntryLineFromMarket()
         {
-            if (!isArmed || armedDirection == ArmDirection.None)
+            if (!isArmed || armedDirection == ArmDirection.None || hasPendingEntry || Position.MarketPosition != MarketPosition.Flat)
+                return;
+
+            // Freeze entry auto-follow while user is interacting with lines to keep drag smooth.
+            if (Mouse.LeftButton == MouseButtonState.Pressed || isDraggingStop || isDraggingTarget || dragFinalizePending)
+                return;
+
+            double tick = sizing.TickSize();
+            if (tick <= 0)
                 return;
 
             double refPrice = GetEntryReference(armedDirection);
             double newEntry = sizing.RoundToTick(refPrice);
-            if (Math.Abs(newEntry - entryPrice) > sizing.TickSize() / 4)
+            if (Math.Abs(newEntry - entryPrice) > tick / 4)
             {
+                double oldStopPrice = stopPrice;
+                double oldTargetPrice = targetPrice;
                 entryPrice = newEntry;
                 entryLineDirty = true;
                 entryLabelDirty = true;
+
+                // While dragging (or after manual adjustment), keep user-defined SL/TP fixed.
+                bool mousePressed = Mouse.LeftButton == MouseButtonState.Pressed;
+                bool dragGuardActive = mousePressed || dragFinalizePending;
+                bool canMoveStop = !isDraggingStop && !dragGuardActive && !userAdjustedStopWhileArmed;
+                bool canMoveTarget = !isDraggingTarget && !dragGuardActive && !userAdjustedTargetWhileArmed;
+
+                if (canMoveStop)
+                    stopPrice = sizing.RoundToTick(entryPrice + armedStopOffsetTicks * tick);
+                if (canMoveTarget)
+                    targetPrice = sizing.RoundToTick(entryPrice + armedTargetOffsetTicks * tick);
+
+                bool clamped;
+                double clampedStop = stopPrice;
+                double clampedTarget = targetPrice;
+                EnforceValidity(GetWorkingDirection(), ref clampedStop, ref clampedTarget, out clamped);
+                if (canMoveStop)
+                    stopPrice = clampedStop;
+                if (canMoveTarget)
+                    targetPrice = clampedTarget;
+
+                if (canMoveStop && Math.Abs(stopPrice - oldStopPrice) > tick / 8)
+                {
+                    stopLineDirty = true;
+                    stopLabelDirty = true;
+                    armedStopOffsetTicks = (stopPrice - entryPrice) / tick;
+                }
+                if (canMoveTarget && Math.Abs(targetPrice - oldTargetPrice) > tick / 8)
+                {
+                    targetLineDirty = true;
+                    targetLabelDirty = true;
+                    armedTargetOffsetTicks = (targetPrice - entryPrice) / tick;
+                }
             }
+        }
+
+        // Fallback capture on mouse-up: if drag was not detected during ticks, read actual line positions from chart.
+        private bool CaptureManualLineAdjustmentsOnFinalize()
+        {
+            if (chartLines == null)
+                return false;
+
+            double tick = sizing.TickSize();
+            if (tick <= 0)
+                return false;
+
+            bool changed = false;
+
+            double? stopCandidate = chartLines.GetLinePrice(RiskRayChartLines.LineKind.Stop);
+            if (stopCandidate.HasValue)
+            {
+                double snapped = sizing.RoundToTick(stopCandidate.Value);
+                if (Math.Abs(snapped - stopPrice) >= tick / 4)
+                {
+                    stopPrice = snapped;
+                    changed = true;
+                    isDraggingStop = true;
+                    if (isArmed && !hasPendingEntry)
+                    {
+                        userAdjustedStopWhileArmed = true;
+                        armedStopOffsetTicks = (stopPrice - entryPrice) / tick;
+                        LogDebug($"ARM stop offset updated on finalize: {armedStopOffsetTicks:F1}t");
+                    }
+                }
+            }
+
+            double? targetCandidate = chartLines.GetLinePrice(RiskRayChartLines.LineKind.Target);
+            if (targetCandidate.HasValue)
+            {
+                double snapped = sizing.RoundToTick(targetCandidate.Value);
+                if (Math.Abs(snapped - targetPrice) >= tick / 4)
+                {
+                    targetPrice = snapped;
+                    changed = true;
+                    isDraggingTarget = true;
+                    if (isArmed && !hasPendingEntry)
+                    {
+                        userAdjustedTargetWhileArmed = true;
+                        armedTargetOffsetTicks = (targetPrice - entryPrice) / tick;
+                        LogDebug($"ARM target offset updated on finalize: {armedTargetOffsetTicks:F1}t");
+                    }
+                }
+            }
+
+            if (!changed)
+                return false;
+
+            bool clamped = false;
+            if (ShouldClampDraggedLines())
+            {
+                double stop = stopPrice;
+                double target = targetPrice;
+                EnforceValidity(GetWorkingDirection(), ref stop, ref target, out clamped);
+                stopPrice = stop;
+                targetPrice = target;
+            }
+            chartLines.SetLinePrice(RiskRayChartLines.LineKind.Stop, stopPrice);
+            chartLines.SetLinePrice(RiskRayChartLines.LineKind.Target, targetPrice);
+            stopLineDirty = false;
+            targetLineDirty = false;
+            stopLabelDirty = true;
+            targetLabelDirty = true;
+            if (clamped)
+                LogClampOnce("Line clamped at drag end");
+
+            return true;
         }
 
         // Detect user drags on stop/target lines, clamp to valid prices, and push ChangeOrder when live orders exist.
         private void ProcessLineDrag(RiskRayChartLines.LineKind kind, ref double trackedPrice, bool isStop)
         {
-            if (chartLines == null || suppressLineEvents)
+            bool userInteracting = Mouse.LeftButton == MouseButtonState.Pressed || isDraggingStop || isDraggingTarget;
+            if (chartLines == null || (suppressLineEvents && !userInteracting))
                 return;
 
             double? candidate = chartLines.GetLinePrice(kind);
@@ -1005,16 +1153,28 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (direction == MarketPosition.Flat && !isArmed)
                 return;
 
-            bool clamped;
+            bool clamped = false;
             double stop = stopPrice;
             double target = targetPrice;
-            EnforceValidity(direction, ref stop, ref target, out clamped);
+            if (ShouldClampDraggedLines())
+                EnforceValidity(direction, ref stop, ref target, out clamped);
 
             if (isStop)
             {
                 stopPrice = stop;
                 chartLines.SetLinePrice(RiskRayChartLines.LineKind.Stop, stopPrice);
+                stopLineDirty = false;
                 stopLabelDirty = true;
+                if (isArmed && !hasPendingEntry)
+                {
+                    double tick = sizing.TickSize();
+                    if (tick > 0)
+                    {
+                        userAdjustedStopWhileArmed = true;
+                        armedStopOffsetTicks = (stopPrice - entryPrice) / tick;
+                        LogDebug($"ARM stop offset updated by drag: {armedStopOffsetTicks:F1}t");
+                    }
+                }
                 LogDebugDrag("DragMove SL ->", stopPrice);
                 if (IsOrderActive(stopOrder) && Position.MarketPosition != MarketPosition.Flat && EnsureSelfCheckPassed())
                 {
@@ -1030,7 +1190,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 targetPrice = target;
                 chartLines.SetLinePrice(RiskRayChartLines.LineKind.Target, targetPrice);
+                targetLineDirty = false;
                 targetLabelDirty = true;
+                if (isArmed && !hasPendingEntry)
+                {
+                    double tick = sizing.TickSize();
+                    if (tick > 0)
+                    {
+                        userAdjustedTargetWhileArmed = true;
+                        armedTargetOffsetTicks = (targetPrice - entryPrice) / tick;
+                        LogDebug($"ARM target offset updated by drag: {armedTargetOffsetTicks:F1}t");
+                    }
+                }
                 LogDebugDrag("DragMove TP ->", targetPrice);
                 if (targetOrder != null && targetOrder.OrderState == OrderState.Working && EnsureSelfCheckPassed())
                     SafeExecute("ChangeOrder-TargetDrag", () => ChangeOrder(targetOrder, targetOrder.Quantity, targetPrice, targetOrder.StopPrice));
@@ -1429,38 +1600,95 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             bool stopTextChanged = stopLbl != lastStopLabel;
-            if (stopLabelDirty || stopTextChanged || stopPriceMoved)
+            bool stopNeedsLineRefresh = stopLabelDirty || stopPriceMoved;
+            bool stopNeedsLabelOnlyRefresh = !stopNeedsLineRefresh && stopTextChanged;
+            if (isDraggingStop)
             {
-                double oldStopPrice = lastStopLabelPrice;
-                chartLines.UpsertLine(RiskRayChartLines.LineKind.Stop, stopPrice, stopLbl);
-                lastStopLabel = stopLbl;
-                lastStopLabelPrice = stopPrice;
-                stopLabelDirty = false;
-                LogLabelRefresh("SL", stopTextChanged, stopPriceMoved, oldStopPrice, stopPrice);
+                if (stopNeedsLineRefresh || stopNeedsLabelOnlyRefresh)
+                {
+                    double oldStopPrice = lastStopLabelPrice;
+                    chartLines.UpdateLineLabel(RiskRayChartLines.LineKind.Stop, stopLbl);
+                    lastStopLabel = stopLbl;
+                    lastStopLabelPrice = stopPrice;
+                    stopLabelDirty = false;
+                    LogLabelRefresh("SL", stopTextChanged, stopPriceMoved, oldStopPrice, stopPrice);
+                }
+            }
+            else
+            {
+                if (stopNeedsLineRefresh)
+                {
+                    double oldStopPrice = lastStopLabelPrice;
+                    chartLines.UpsertLine(RiskRayChartLines.LineKind.Stop, stopPrice, stopLbl);
+                    lastStopLabel = stopLbl;
+                    lastStopLabelPrice = stopPrice;
+                    stopLabelDirty = false;
+                    LogLabelRefresh("SL", stopTextChanged, stopPriceMoved, oldStopPrice, stopPrice);
+                }
+                else if (stopNeedsLabelOnlyRefresh)
+                {
+                    double oldStopPrice = lastStopLabelPrice;
+                    chartLines.UpdateLineLabel(RiskRayChartLines.LineKind.Stop, stopLbl);
+                    lastStopLabel = stopLbl;
+                    lastStopLabelPrice = stopPrice;
+                    LogLabelRefresh("SL", true, false, oldStopPrice, stopPrice);
+                }
             }
 
             bool targetTextChanged = targetLbl != lastTargetLabel;
-            if (targetLabelDirty || targetTextChanged || targetPriceMoved)
+            bool targetNeedsLineRefresh = targetLabelDirty || targetPriceMoved;
+            bool targetNeedsLabelOnlyRefresh = !targetNeedsLineRefresh && targetTextChanged;
+            if (isDraggingTarget)
             {
-                double oldTargetPrice = lastTargetLabelPrice;
-                chartLines.UpsertLine(RiskRayChartLines.LineKind.Target, targetPrice, targetLbl);
-                lastTargetLabel = targetLbl;
-                lastTargetLabelPrice = targetPrice;
-                targetLabelDirty = false;
-                LogLabelRefresh("TP", targetTextChanged, targetPriceMoved, oldTargetPrice, targetPrice);
+                if (targetNeedsLineRefresh || targetNeedsLabelOnlyRefresh)
+                {
+                    double oldTargetPrice = lastTargetLabelPrice;
+                    chartLines.UpdateLineLabel(RiskRayChartLines.LineKind.Target, targetLbl);
+                    lastTargetLabel = targetLbl;
+                    lastTargetLabelPrice = targetPrice;
+                    targetLabelDirty = false;
+                    LogLabelRefresh("TP", targetTextChanged, targetPriceMoved, oldTargetPrice, targetPrice);
+                }
+            }
+            else
+            {
+                if (targetNeedsLineRefresh)
+                {
+                    double oldTargetPrice = lastTargetLabelPrice;
+                    chartLines.UpsertLine(RiskRayChartLines.LineKind.Target, targetPrice, targetLbl);
+                    lastTargetLabel = targetLbl;
+                    lastTargetLabelPrice = targetPrice;
+                    targetLabelDirty = false;
+                    LogLabelRefresh("TP", targetTextChanged, targetPriceMoved, oldTargetPrice, targetPrice);
+                }
+                else if (targetNeedsLabelOnlyRefresh)
+                {
+                    double oldTargetPrice = lastTargetLabelPrice;
+                    chartLines.UpdateLineLabel(RiskRayChartLines.LineKind.Target, targetLbl);
+                    lastTargetLabel = targetLbl;
+                    lastTargetLabelPrice = targetPrice;
+                    LogLabelRefresh("TP", true, false, oldTargetPrice, targetPrice);
+                }
             }
 
-            if (DebugBlink && hud.TryComputeSizing(snapshot, out double tickDbg, out double tickValueDbg, out double entryRefDbg, out _))
+            if (DebugBlink)
             {
-                double rewardTicksDbg = tickDbg > 0 ? Math.Abs(targetPrice - entryRefDbg) / tickDbg : 0;
-                double rewardQtyDbg = Math.Max(1, GetDisplayQuantity());
-                double rewardDbg = rewardTicksDbg * tickValueDbg * rewardQtyDbg;
-                string ptsTicksDbg = "CALC…";
-                int open = targetLbl.LastIndexOf('(');
-                int close = targetLbl.LastIndexOf(')');
-                if (open >= 0 && close > open + 1)
-                    ptsTicksDbg = targetLbl.Substring(open + 1, close - open - 1);
-                Print($"{Prefix("DEBUG")} TP label -> $={rewardDbg:F2}, targetTicks={rewardTicksDbg:F1}, ptsTicks={ptsTicksDbg}");
+                double tickDbg;
+                double tickValueDbg;
+                double entryRefDbg;
+                string reasonDbg;
+                if (hud.TryComputeSizing(snapshot, out tickDbg, out tickValueDbg, out entryRefDbg, out reasonDbg))
+                {
+                    double rewardTicksDbg = tickDbg > 0 ? Math.Abs(targetPrice - entryRefDbg) / tickDbg : 0;
+                    double rewardQtyDbg = Math.Max(1, GetDisplayQuantity());
+                    double rewardDbg = rewardTicksDbg * tickValueDbg * rewardQtyDbg;
+                    string ptsTicksDbg = "CALC…";
+                    int open = targetLbl.LastIndexOf('(');
+                    int close = targetLbl.LastIndexOf(')');
+                    if (open >= 0 && close > open + 1)
+                        ptsTicksDbg = targetLbl.Substring(open + 1, close - open - 1);
+                    Print($"{Prefix("DEBUG")} TP label -> $={rewardDbg:F2}, targetTicks={rewardTicksDbg:F1}, ptsTicks={ptsTicksDbg}");
+                }
             }
 
             if (LogLevelSetting == LogLevelOption.Debug && ShouldLogDebug())
@@ -1551,6 +1779,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         #endregion
 
         #region Lines/Draw Objects (helpers)
+
+        // During ARMED pre-entry, allow free manual placement; clamp only once at confirm/live-order phase.
+        private bool ShouldClampDraggedLines()
+        {
+            return !(isArmed && !hasPendingEntry && Position.MarketPosition == MarketPosition.Flat);
+        }
 
         // Clamp stop/target to stay one tick off current bid/ask; protects unmanaged orders from instantly triggering.
         private void EnforceValidity(MarketPosition direction, ref double stop, ref double target, out bool clamped)
@@ -1775,6 +2009,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ChartControl.PreviewMouseLeftButtonUp += ChartControl_PreviewMouseLeftButtonUp;
                 ChartControl.MouseLeftButtonUp += ChartControl_MouseLeftButtonUp;
                 ChartControl.MouseLeave += ChartControl_MouseLeave;
+                ChartControl.MouseMove += ChartControl_MouseMove;
                 chartEventsAttached = true;
                 SetMilestone("AttachChartEvents");
                 LogInfo("Chart events attached");
@@ -1798,6 +2033,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ChartControl.PreviewMouseLeftButtonUp -= ChartControl_PreviewMouseLeftButtonUp;
                 ChartControl.MouseLeftButtonUp -= ChartControl_MouseLeftButtonUp;
                 ChartControl.MouseLeave -= ChartControl_MouseLeave;
+                ChartControl.MouseMove -= ChartControl_MouseMove;
                 chartEventsAttached = false;
                 SetMilestone("DetachChartEvents");
                 LogInfo("Chart events detached");
@@ -1806,17 +2042,46 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ChartControl_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
         {
+            dragFinalizePending = true;
             TriggerCustomEvent(_ => SafeExecute("PreviewMouseUp", FinalizeDrag), null);
         }
 
         private void ChartControl_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
         {
+            dragFinalizePending = true;
             TriggerCustomEvent(_ => SafeExecute("MouseUp", FinalizeDrag), null);
         }
 
         private void ChartControl_MouseLeave(object sender, MouseEventArgs e)
         {
+            dragFinalizePending = true;
             TriggerCustomEvent(_ => SafeExecute("MouseLeave", FinalizeDrag), null);
+        }
+
+        private void ChartControl_MouseMove(object sender, MouseEventArgs e)
+        {
+            if (Mouse.LeftButton != MouseButtonState.Pressed)
+                return;
+
+            if (!isArmed && Position.MarketPosition == MarketPosition.Flat)
+                return;
+
+            double elapsedMs = (DateTime.UtcNow - lastMouseDragPulseUtc).TotalMilliseconds;
+            if (lastMouseDragPulseUtc != DateTime.MinValue && elapsedMs < MouseDragPulseThrottleMs)
+                return;
+
+            lastMouseDragPulseUtc = DateTime.UtcNow;
+            TriggerCustomEvent(_ => SafeExecute("MouseMoveDragPulse", HandleMouseDragPulse), null);
+        }
+
+        // Poll drag movement on mouse move so TP/SL labels and sizing update even between market ticks.
+        private void HandleMouseDragPulse()
+        {
+            if (State != State.Realtime)
+                return;
+
+            ProcessLineDrag(RiskRayChartLines.LineKind.Stop, ref stopPrice, true);
+            ProcessLineDrag(RiskRayChartLines.LineKind.Target, ref targetPrice, false);
         }
 
         // Finalizes drag (strategy thread): clamps prices, syncs ChangeOrder, and clears drag flags; ensures stops stay off-market.
@@ -1831,6 +2096,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             try
             {
                 bool hasDrag = isDraggingStop || isDraggingTarget;
+                if (!hasDrag && CaptureManualLineAdjustmentsOnFinalize())
+                    hasDrag = true;
                 if (!hasDrag)
                 {
                     double elapsedMs = (DateTime.UtcNow - lastFinalizeDragTimeUtc).TotalMilliseconds;
@@ -1854,12 +2121,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (isDraggingStop || isDraggingTarget)
                 {
-                    bool clamped;
-                    double stop = stopPrice;
-                    double target = targetPrice;
-                    EnforceValidity(GetWorkingDirection(), ref stop, ref target, out clamped);
-                    stopPrice = stop;
-                    targetPrice = target;
+                    bool clamped = false;
+                    if (ShouldClampDraggedLines())
+                    {
+                        double stop = stopPrice;
+                        double target = targetPrice;
+                        EnforceValidity(GetWorkingDirection(), ref stop, ref target, out clamped);
+                        stopPrice = stop;
+                        targetPrice = target;
+                    }
                     if (chartLines != null)
                     {
                         chartLines.SetLinePrice(RiskRayChartLines.LineKind.Stop, stopPrice);
@@ -1889,6 +2159,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             finally
             {
+                dragFinalizePending = false;
                 Interlocked.Exchange(ref finalizeDragInProgress, 0);
             }
         }
@@ -2169,6 +2440,678 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return "¥";
                 default:
                     return "$";
+            }
+        }
+
+        // Fallback helper types kept inside RiskRay so NT8 can compile this strategy
+        // even when external helper files are not in the active compile scope.
+        private sealed class RiskRayTagNames
+        {
+            private readonly string prefix;
+
+            public RiskRayTagNames(string orderTagPrefix)
+            {
+                string normalized = string.IsNullOrWhiteSpace(orderTagPrefix) ? "RR_" : orderTagPrefix.Trim();
+                prefix = string.IsNullOrWhiteSpace(normalized) ? "RR_" : normalized;
+            }
+
+            public string Tag(string suffix)
+            {
+                return $"{prefix}{suffix}";
+            }
+
+            public string EntryLineTag => Tag("ENTRY_LINE");
+            public string StopLineTag => Tag("STOP_LINE");
+            public string TargetLineTag => Tag("TARGET_LINE");
+
+            public string EntryLabelTag => Tag("ENTRY_LABEL");
+            public string StopLabelTag => Tag("STOP_LABEL");
+            public string TargetLabelTag => Tag("TARGET_LABEL");
+
+            public string EntrySignalLong => Tag("ENTRY_LONG");
+            public string EntrySignalShort => Tag("ENTRY_SHORT");
+            public string StopSignal => Tag("SL");
+            public string TargetSignal => Tag("TP");
+            public string CloseSignal => Tag("CLOSE");
+            public string BeSignal => Tag("BE");
+            public string TrailSignal => Tag("TRAIL");
+            public string HudNotifyTag => Tag("HUD_NOTIFY");
+        }
+
+        private sealed class RiskRaySizing
+        {
+            private readonly Func<Instrument> instrumentProvider;
+            private readonly Func<double> cachedTickGetter;
+            private readonly Action<double> cachedTickSetter;
+
+            public RiskRaySizing(Func<Instrument> instrumentProvider, Func<double> cachedTickGetter, Action<double> cachedTickSetter)
+            {
+                this.instrumentProvider = instrumentProvider;
+                this.cachedTickGetter = cachedTickGetter;
+                this.cachedTickSetter = cachedTickSetter;
+            }
+
+            public double TickSize()
+            {
+                Instrument instrument = instrumentProvider();
+                if (instrument != null && instrument.MasterInstrument != null)
+                {
+                    double tick = instrument.MasterInstrument.TickSize;
+                    if (tick > 0)
+                        cachedTickSetter(tick);
+                    return tick;
+                }
+
+                double cachedTick = cachedTickGetter();
+                return cachedTick > 0 ? cachedTick : 0.01;
+            }
+
+            public double TickValue()
+            {
+                Instrument instrument = instrumentProvider();
+                return TickSize() * (instrument?.MasterInstrument.PointValue ?? 1);
+            }
+
+            public double RoundToTick(double price)
+            {
+                Instrument instrument = instrumentProvider();
+                if (instrument != null && instrument.MasterInstrument != null)
+                    return instrument.MasterInstrument.RoundToTickSize(price);
+
+                double cachedTick = cachedTickGetter();
+                if (cachedTick > 0)
+                    return Math.Round(price / cachedTick) * cachedTick;
+
+                return price;
+            }
+
+            public int CalculateQuantity(double entryPrice, double stopPrice, double fixedRiskUsd, bool commissionOn, double commissionPerContractRoundTurn, int maxContracts)
+            {
+                double tick = TickSize();
+                double distanceTicks = Math.Abs(entryPrice - stopPrice) / tick;
+                if (distanceTicks <= 0)
+                    return 0;
+
+                double perContractRisk = distanceTicks * TickValue();
+                if (commissionOn)
+                    perContractRisk += commissionPerContractRoundTurn;
+
+                double rawQty = perContractRisk > 0 ? fixedRiskUsd / perContractRisk : 0;
+                int qty = (int)Math.Floor(rawQty + 0.5);
+                qty = Math.Min(qty, maxContracts);
+                return qty;
+            }
+        }
+
+        private sealed class RiskRayChartLines
+        {
+            public enum LineKind
+            {
+                Entry,
+                Stop,
+                Target
+            }
+
+            private readonly Strategy owner;
+            private readonly RiskRayTagNames tags;
+            private readonly Func<double> tickSizeProvider;
+            private readonly Func<double, double> roundToTickProvider;
+            private readonly Func<MarketPosition> workingDirectionProvider;
+            private readonly Func<int> labelBarsAgoProvider;
+            private readonly Func<double> labelOffsetTicksProvider;
+            private readonly Func<bool> getSuppressLineEvents;
+            private readonly Action<bool> setSuppressLineEvents;
+            private readonly Func<string> normalizedPrefixProvider;
+            private readonly Action<string> cleanupLogAction;
+
+            private HorizontalLine entryLine;
+            private HorizontalLine stopLine;
+            private HorizontalLine targetLine;
+            private readonly List<DrawingTool> trackedDrawObjects = new List<DrawingTool>();
+
+            public RiskRayChartLines(
+                Strategy owner,
+                RiskRayTagNames tags,
+                Func<double> tickSizeProvider,
+                Func<double, double> roundToTickProvider,
+                Func<MarketPosition> workingDirectionProvider,
+                Func<int> labelBarsAgoProvider,
+                Func<double> labelOffsetTicksProvider,
+                Func<bool> getSuppressLineEvents,
+                Action<bool> setSuppressLineEvents,
+                Func<string> normalizedPrefixProvider,
+                Action<string> cleanupLogAction)
+            {
+                this.owner = owner;
+                this.tags = tags;
+                this.tickSizeProvider = tickSizeProvider;
+                this.roundToTickProvider = roundToTickProvider;
+                this.workingDirectionProvider = workingDirectionProvider;
+                this.labelBarsAgoProvider = labelBarsAgoProvider;
+                this.labelOffsetTicksProvider = labelOffsetTicksProvider;
+                this.getSuppressLineEvents = getSuppressLineEvents;
+                this.setSuppressLineEvents = setSuppressLineEvents;
+                this.normalizedPrefixProvider = normalizedPrefixProvider;
+                this.cleanupLogAction = cleanupLogAction;
+            }
+
+            public void WithSuppressedEvents(Action action)
+            {
+                if (action == null)
+                    return;
+
+                bool previous = getSuppressLineEvents != null && getSuppressLineEvents();
+                setSuppressLineEvents?.Invoke(true);
+                try
+                {
+                    action();
+                }
+                finally
+                {
+                    setSuppressLineEvents?.Invoke(previous);
+                }
+            }
+
+            public void UpsertLine(LineKind kind, double price, string labelText)
+            {
+                WithSuppressedEvents(() =>
+                {
+                    HorizontalLine line = GetLineRef(kind);
+                    Brush lineBrush = LineBrush(kind);
+                    if (line == null)
+                    {
+                        line = Draw.HorizontalLine(owner, LineTag(kind), price, lineBrush);
+                        if (line != null)
+                        {
+                            line.Stroke = new Stroke(lineBrush, DashStyleHelper.Solid, 2);
+                            line.IsLocked = kind == LineKind.Entry;
+                            line.IsAutoScale = false;
+                            SetLineRef(kind, line);
+                            TrackDrawObject(line);
+                        }
+                    }
+                    else
+                    {
+                        SetLineAnchors(line, price);
+                        line.IsLocked = kind == LineKind.Entry;
+                        line.IsAutoScale = false;
+                    }
+
+                    UpsertLabel(kind, price, labelText, lineBrush);
+                });
+            }
+
+            public void UpdateLineLabel(LineKind kind, string text)
+            {
+                WithSuppressedEvents(() =>
+                {
+                    HorizontalLine line = GetLineRef(kind);
+                    if (line == null || line.StartAnchor == null)
+                        return;
+
+                    double linePrice = line.StartAnchor.Price;
+                    UpsertLabel(kind, linePrice, text, LineBrush(kind));
+                });
+            }
+
+            public void SetLinePrice(LineKind kind, double price)
+            {
+                WithSuppressedEvents(() =>
+                {
+                    HorizontalLine line = GetLineRef(kind);
+                    if (line != null)
+                        SetLineAnchors(line, price);
+                });
+            }
+
+            public double? GetLinePrice(LineKind kind)
+            {
+                HorizontalLine line = GetLineRef(kind);
+                if (line == null || line.StartAnchor == null)
+                    return null;
+                return line.StartAnchor.Price;
+            }
+
+            public bool HasActiveLines()
+            {
+                return entryLine != null || stopLine != null || targetLine != null;
+            }
+
+            public void RemoveAllDrawObjects()
+            {
+                string normalizedPrefix = normalizedPrefixProvider != null ? normalizedPrefixProvider() : string.Empty;
+                WithSuppressedEvents(() =>
+                {
+                    HashSet<string> drawTags = new HashSet<string>();
+                    drawTags.Add(tags.EntryLineTag);
+                    drawTags.Add(tags.StopLineTag);
+                    drawTags.Add(tags.TargetLineTag);
+                    drawTags.Add(tags.EntryLabelTag);
+                    drawTags.Add(tags.StopLabelTag);
+                    drawTags.Add(tags.TargetLabelTag);
+                    drawTags.Add(tags.HudNotifyTag);
+                    foreach (DrawingTool obj in trackedDrawObjects)
+                    {
+                        if (obj == null || obj.Tag == null)
+                            continue;
+
+                        string tagStr = obj.Tag.ToString();
+                        if (string.IsNullOrEmpty(tagStr))
+                            continue;
+
+                        if (tagStr.StartsWith(normalizedPrefix, StringComparison.Ordinal))
+                            drawTags.Add(tagStr);
+                    }
+
+                    foreach (string tag in drawTags)
+                        TryRemoveDrawObject(tag);
+
+                    trackedDrawObjects.Clear();
+                    entryLine = null;
+                    stopLine = null;
+                    targetLine = null;
+                });
+            }
+
+            public void ShowHudNotification(string text)
+            {
+                WithSuppressedEvents(() =>
+                {
+                    TryRemoveDrawObject(tags.HudNotifyTag);
+                    DrawingTool note = Draw.TextFixed(
+                        owner,
+                        tags.HudNotifyTag,
+                        text,
+                        TextPosition.TopRight,
+                        Brushes.White,
+                        new SimpleFont("Segoe UI", 13),
+                        Brushes.Black,
+                        Brushes.White,
+                        4,
+                        DashStyleHelper.Solid,
+                        1,
+                        false,
+                        null);
+
+                    TrackDrawObject(note);
+                });
+            }
+
+            private void UpsertLabel(LineKind kind, double price, string text, Brush brush)
+            {
+                double offsetTicks = labelOffsetTicksProvider != null ? labelOffsetTicksProvider() : 0;
+                offsetTicks = Math.Max(0, offsetTicks);
+                double tick = tickSizeProvider != null ? tickSizeProvider() : 0;
+                MarketPosition direction = workingDirectionProvider != null ? workingDirectionProvider() : MarketPosition.Flat;
+                bool isStop = kind == LineKind.Stop;
+
+                double offsetPrice = price;
+                if (direction == MarketPosition.Long)
+                    offsetPrice = isStop ? price - offsetTicks * tick : price + offsetTicks * tick;
+                else if (direction == MarketPosition.Short)
+                    offsetPrice = isStop ? price + offsetTicks * tick : price - offsetTicks * tick;
+
+                offsetPrice = roundToTickProvider != null ? roundToTickProvider(offsetPrice) : offsetPrice;
+                TryRemoveDrawObject(LabelTag(kind));
+                int barsAgo = labelBarsAgoProvider != null ? labelBarsAgoProvider() : 0;
+                DrawingTool label = Draw.Text(owner, LabelTag(kind), text, barsAgo, offsetPrice, brush);
+                if (label != null)
+                {
+                    // Labels should follow line updates, not be independently draggable by user.
+                    label.IsLocked = true;
+                    label.IsAutoScale = false;
+                }
+                TrackDrawObject(label);
+            }
+
+            private HorizontalLine GetLineRef(LineKind kind)
+            {
+                switch (kind)
+                {
+                    case LineKind.Entry:
+                        return entryLine;
+                    case LineKind.Stop:
+                        return stopLine;
+                    default:
+                        return targetLine;
+                }
+            }
+
+            private void SetLineRef(LineKind kind, HorizontalLine line)
+            {
+                switch (kind)
+                {
+                    case LineKind.Entry:
+                        entryLine = line;
+                        break;
+                    case LineKind.Stop:
+                        stopLine = line;
+                        break;
+                    default:
+                        targetLine = line;
+                        break;
+                }
+            }
+
+            private string LineTag(LineKind kind)
+            {
+                switch (kind)
+                {
+                    case LineKind.Entry:
+                        return tags.EntryLineTag;
+                    case LineKind.Stop:
+                        return tags.StopLineTag;
+                    default:
+                        return tags.TargetLineTag;
+                }
+            }
+
+            private string LabelTag(LineKind kind)
+            {
+                switch (kind)
+                {
+                    case LineKind.Entry:
+                        return tags.EntryLabelTag;
+                    case LineKind.Stop:
+                        return tags.StopLabelTag;
+                    default:
+                        return tags.TargetLabelTag;
+                }
+            }
+
+            private Brush LineBrush(LineKind kind)
+            {
+                switch (kind)
+                {
+                    case LineKind.Entry:
+                        return Brushes.Black;
+                    case LineKind.Stop:
+                        return Brushes.Red;
+                    default:
+                        return Brushes.ForestGreen;
+                }
+            }
+
+            private void SetLineAnchors(HorizontalLine line, double price)
+            {
+                if (line == null)
+                    return;
+                if (line.StartAnchor != null)
+                    line.StartAnchor.Price = price;
+                if (line.EndAnchor != null)
+                    line.EndAnchor.Price = price;
+            }
+
+            private void TrackDrawObject(DrawingTool obj)
+            {
+                if (obj == null)
+                    return;
+
+                trackedDrawObjects.RemoveAll(o => o != null && Equals(o.Tag, obj.Tag));
+                trackedDrawObjects.Add(obj);
+            }
+
+            private void TryRemoveDrawObject(string tag)
+            {
+                if (string.IsNullOrEmpty(tag))
+                    return;
+
+                try
+                {
+                    owner.RemoveDrawObject(tag);
+                }
+                catch (Exception ex)
+                {
+                    cleanupLogAction?.Invoke(ex.Message);
+                }
+            }
+        }
+
+        private sealed class RiskRayHud
+        {
+            public struct Snapshot
+            {
+                public Snapshot(
+                    double entryPrice,
+                    double stopPrice,
+                    double targetPrice,
+                    double fixedRiskUSD,
+                    bool commissionOn,
+                    double commissionPerContractRoundTurn,
+                    int maxContracts,
+                    double maxRiskWarningUSD)
+                {
+                    EntryPrice = entryPrice;
+                    StopPrice = stopPrice;
+                    TargetPrice = targetPrice;
+                    FixedRiskUSD = fixedRiskUSD;
+                    CommissionOn = commissionOn;
+                    CommissionPerContractRoundTurn = commissionPerContractRoundTurn;
+                    MaxContracts = maxContracts;
+                    MaxRiskWarningUSD = maxRiskWarningUSD;
+                }
+
+                public double EntryPrice { get; }
+                public double StopPrice { get; }
+                public double TargetPrice { get; }
+                public double FixedRiskUSD { get; }
+                public bool CommissionOn { get; }
+                public double CommissionPerContractRoundTurn { get; }
+                public int MaxContracts { get; }
+                public double MaxRiskWarningUSD { get; }
+            }
+
+            private readonly RiskRaySizing sizing;
+            private readonly Func<Instrument> instrumentProvider;
+            private readonly Func<double> entryReferenceForRiskProvider;
+            private readonly Func<int> displayQuantityProvider;
+            private readonly Func<string> currencySymbolProvider;
+
+            private string cachedEntryLabelText;
+            private string cachedStopLabelText;
+            private string cachedTargetLabelText;
+            private string cachedQtyLabelText;
+            private string cachedRrLabelText;
+
+            public RiskRayHud(
+                RiskRaySizing sizing,
+                Func<Instrument> instrumentProvider,
+                Func<double> entryReferenceForRiskProvider,
+                Func<int> displayQuantityProvider,
+                Func<string> currencySymbolProvider)
+            {
+                this.sizing = sizing;
+                this.instrumentProvider = instrumentProvider;
+                this.entryReferenceForRiskProvider = entryReferenceForRiskProvider;
+                this.displayQuantityProvider = displayQuantityProvider;
+                this.currencySymbolProvider = currencySymbolProvider;
+            }
+
+            public void ResetCaches()
+            {
+                cachedEntryLabelText = null;
+                cachedStopLabelText = null;
+                cachedTargetLabelText = null;
+                cachedQtyLabelText = null;
+                cachedRrLabelText = null;
+            }
+
+            public string GetEntryLabelSafe(Snapshot s)
+            {
+                string qtyLabel = GetQtyLabel(s);
+                string rrText = GetRiskRewardText(s);
+                if (string.IsNullOrEmpty(qtyLabel) || qtyLabel == "0 contracts")
+                    qtyLabel = cachedQtyLabelText ?? "CALC…";
+
+                if (string.IsNullOrEmpty(rrText) || rrText == "R0.00" || rrText == "R—")
+                    rrText = cachedRrLabelText ?? "R?";
+
+                string combined = $"{qtyLabel} | {rrText}";
+                cachedEntryLabelText = combined;
+                return combined;
+            }
+
+            public string GetQtyLabel(Snapshot s)
+            {
+                double tick;
+                double tickValue;
+                double entryRefUnused;
+                string reasonUnused;
+                if (!TryComputeSizing(s, out tick, out tickValue, out entryRefUnused, out reasonUnused))
+                    return UseCachedOrPlaceholder(ref cachedQtyLabelText);
+
+                double stopTicks = Math.Abs(s.EntryPrice - s.StopPrice) / tick;
+                double perContractRisk = (stopTicks * tickValue) + (s.CommissionOn ? s.CommissionPerContractRoundTurn : 0);
+                double rawQty = perContractRisk > 0 ? s.FixedRiskUSD / perContractRisk : 0;
+                int roundedQty = (int)Math.Floor(rawQty + 0.5);
+                int cappedQty = Math.Min(roundedQty, s.MaxContracts);
+
+                string label = cappedQty < 1
+                    ? $"{rawQty:F2} (min 1)"
+                    : $"{cappedQty} contracts";
+
+                cachedQtyLabelText = label;
+                return label;
+            }
+
+            public string GetStopLabel(Snapshot s)
+            {
+                double tick;
+                double tickValue;
+                double entryRef;
+                string reasonUnused;
+                if (!TryComputeSizing(s, out tick, out tickValue, out entryRef, out reasonUnused))
+                    return UseCachedOrPlaceholder(ref cachedStopLabelText);
+
+                double stopDistanceTicks = Math.Abs(entryRef - s.StopPrice) / tick;
+                if (double.IsNaN(stopDistanceTicks) || double.IsInfinity(stopDistanceTicks))
+                    return UseCachedOrPlaceholder(ref cachedStopLabelText);
+
+                if (stopDistanceTicks <= double.Epsilon)
+                {
+                    cachedStopLabelText = "SL: BE";
+                    return cachedStopLabelText;
+                }
+
+                double perContractRisk = (stopDistanceTicks * tickValue) + (s.CommissionOn ? s.CommissionPerContractRoundTurn : 0);
+                double riskQty = Math.Max(1, displayQuantityProvider != null ? displayQuantityProvider() : 0);
+                double totalRisk = perContractRisk * riskQty;
+                string distanceText = FormatPointsAndTicks(stopDistanceTicks, tick);
+                string label = $"SL: -{currencySymbolProvider()}{totalRisk:F2} ({distanceText})";
+
+                const double legacyWarn = 200d;
+                double effectiveWarn = s.MaxRiskWarningUSD > 0 ? s.MaxRiskWarningUSD : s.FixedRiskUSD;
+                if (s.MaxRiskWarningUSD > 0
+                    && Math.Abs(s.MaxRiskWarningUSD - legacyWarn) < 0.0001
+                    && Math.Abs(s.FixedRiskUSD - legacyWarn) > 0.0001)
+                {
+                    effectiveWarn = s.FixedRiskUSD;
+                }
+                if (totalRisk > effectiveWarn)
+                    label = $"!! {label} !!";
+
+                cachedStopLabelText = label;
+                return label;
+            }
+
+            public string GetTargetLabel(Snapshot s)
+            {
+                double tick;
+                double tickValue;
+                double entryRef;
+                string reasonUnused;
+                if (!TryComputeSizing(s, out tick, out tickValue, out entryRef, out reasonUnused))
+                    return UseCachedOrPlaceholder(ref cachedTargetLabelText);
+
+                double rewardTicks = Math.Abs(s.TargetPrice - entryRef) / tick;
+                if (double.IsNaN(rewardTicks) || double.IsInfinity(rewardTicks))
+                    return UseCachedOrPlaceholder(ref cachedTargetLabelText);
+
+                double rewardQty = Math.Max(1, displayQuantityProvider != null ? displayQuantityProvider() : 0);
+                double reward = rewardTicks * tickValue * rewardQty;
+                string ptsTicks = FormatPointsAndTicks(rewardTicks, tick);
+                string label = $"TP: +{currencySymbolProvider()}{reward:F2} ({ptsTicks})";
+                cachedTargetLabelText = label;
+                return label;
+            }
+
+            public string GetRiskRewardText(Snapshot s)
+            {
+                double tick;
+                double tickValueUnused;
+                double entryRef;
+                string reasonUnused;
+                if (!TryComputeSizing(s, out tick, out tickValueUnused, out entryRef, out reasonUnused))
+                    return UseCachedOrPlaceholder(ref cachedRrLabelText);
+
+                double stopTicks = Math.Abs(entryRef - s.StopPrice) / tick;
+                double rewardTicks = Math.Abs(s.TargetPrice - entryRef) / tick;
+                if (stopTicks <= double.Epsilon || double.IsNaN(stopTicks) || double.IsInfinity(stopTicks))
+                    return UseCachedOrPlaceholder(ref cachedRrLabelText);
+
+                double rr = rewardTicks / stopTicks;
+                string rrText = Math.Abs(rr - 1.0) < 0.005 ? "R1" : $"R{rr:F2}";
+                cachedRrLabelText = rrText;
+                return rrText;
+            }
+
+            public bool TryComputeSizing(Snapshot s, out double tick, out double tickValue, out double entryRef, out string reason)
+            {
+                tick = sizing.TickSize();
+                tickValue = sizing.TickValue();
+                entryRef = double.NaN;
+
+                Instrument instrument = instrumentProvider != null ? instrumentProvider() : null;
+                if (instrument == null || instrument.MasterInstrument == null)
+                {
+                    reason = "instrument missing";
+                    return false;
+                }
+                if (tick <= 0 || double.IsNaN(tick) || double.IsInfinity(tick))
+                {
+                    reason = "TickSize<=0";
+                    return false;
+                }
+                if (tickValue <= 0 || double.IsNaN(tickValue) || double.IsInfinity(tickValue))
+                {
+                    reason = "TickValue<=0";
+                    return false;
+                }
+
+                entryRef = entryReferenceForRiskProvider != null ? entryReferenceForRiskProvider() : double.NaN;
+                if (double.IsNaN(entryRef) || double.IsInfinity(entryRef) || entryRef <= 0)
+                {
+                    reason = "entryRef invalid";
+                    return false;
+                }
+
+                reason = null;
+                return true;
+            }
+
+            private string UseCachedOrPlaceholder(ref string cache)
+            {
+                if (!string.IsNullOrEmpty(cache))
+                    return cache;
+                return "CALC…";
+            }
+
+            private string FormatPointsAndTicks(double distanceTicks, double tick)
+            {
+                if (tick <= 0 || double.IsNaN(distanceTicks) || double.IsInfinity(distanceTicks))
+                    return "CALC…";
+
+                double points = distanceTicks * tick;
+                double wholePoints = Math.Floor(points + 1e-9);
+                int ticksPerPoint = Math.Max(1, (int)Math.Round(1.0 / tick));
+                int remainingTicks = (int)Math.Round((points - wholePoints) / tick);
+                remainingTicks = Math.Max(0, Math.Min(remainingTicks, ticksPerPoint - 1));
+                if (remainingTicks >= ticksPerPoint)
+                {
+                    wholePoints += 1;
+                    remainingTicks = 0;
+                }
+                return $"{wholePoints}.{remainingTicks}";
             }
         }
 

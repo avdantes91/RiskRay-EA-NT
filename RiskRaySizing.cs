@@ -3,7 +3,7 @@ using NinjaTrader.Cbi;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
-    public class RiskRaySizing
+    public sealed class RiskRaySizing
     {
         private readonly Func<Instrument> instrumentProvider;
         private readonly Func<double> cachedTickGetter;

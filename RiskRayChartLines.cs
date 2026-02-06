@@ -91,6 +91,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     {
                         line.Stroke = new Stroke(lineBrush, DashStyleHelper.Solid, 2);
                         line.IsLocked = kind == LineKind.Entry;
+                        line.IsAutoScale = false;
                         SetLineRef(kind, line);
                         TrackDrawObject(line);
                     }
@@ -101,6 +102,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
 
                 UpsertLabel(kind, price, labelText, lineBrush);
+            });
+        }
+
+        public void UpdateLineLabel(LineKind kind, string text)
+        {
+            WithSuppressedEvents(() =>
+            {
+                HorizontalLine line = GetLineRef(kind);
+                if (line == null || line.StartAnchor == null)
+                    return;
+
+                double linePrice = line.StartAnchor.Price;
+                UpsertLabel(kind, linePrice, text, LineBrush(kind));
             });
         }
 
@@ -205,6 +219,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             TryRemoveDrawObject(LabelTag(kind));
             int barsAgo = labelBarsAgoProvider != null ? labelBarsAgoProvider() : 0;
             DrawingTool label = Draw.Text(owner, LabelTag(kind), text, barsAgo, offsetPrice, brush);
+            if (label != null)
+            {
+                label.IsLocked = false;
+                label.IsAutoScale = false;
+            }
             TrackDrawObject(label);
         }
 
