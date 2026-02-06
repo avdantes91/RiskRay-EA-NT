@@ -1,3 +1,5 @@
+#define RR_USE_INTERNAL_HELPERS
+
 // RiskRay strategy
 // Manual in-chart button panel drives unmanaged bracket orders through ARMED/CONFIRM actions (BUY/SELL/BE/TRAIL/CLOSE).
 // Constraints: strictly user-driven (no automation), single position per instrument, market replay friendly, unmanaged order model only.
@@ -2467,7 +2469,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        #if true
+        #if RR_USE_INTERNAL_HELPERS
         // Fallback helper types kept inside RiskRay so NT8 can compile this strategy
         // even when external helper files are not in the active compile scope.
         private sealed class RiskRayTagNames
