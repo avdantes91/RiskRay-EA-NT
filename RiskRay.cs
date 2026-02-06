@@ -2598,12 +2598,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             lastHotFuseLogTime = DateTime.Now;
             string message = "Bracket incomplete (stop XOR target). Strategy is in FATAL mode (Variant A). " +
-                             "Trading actions are disabled by design. Close position manually and verify SL/TP on broker.";
+                             "Trading actions are disabled by design. Close position manually and verify bracket on broker.";
             LogInfo(message);
             RecordOrderAction($"HOT_FUSE {reason} fatal");
             RecordDiagEvent($"HOT_FUSE {reason}");
-            if (!uiUnavailablePermanently)
-                NotifyFatalOnce(message);
+            if (!uiUnavailablePermanently && CanTouchUi())
+                SafeExecuteUI("HotFuse.Notify", () => NotifyFatalOnce(message));
         }
 
         // Level-gated info logger for user actions and state transitions.
