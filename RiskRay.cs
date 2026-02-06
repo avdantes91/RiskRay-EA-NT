@@ -426,6 +426,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double stopPrice;
         private double targetPrice;
         private double avgEntryPrice;
+        private double lastEntryFillPrice;
+        private bool entryFillConfirmed;
 
         // Unmanaged order handles and OCO group identifier (OrderTagPrefix invariant).
         private Order entryOrder;
@@ -437,6 +439,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lastClampLogTime = DateTime.MinValue;
         private DateTime lastDebugLogTime = DateTime.MinValue;
         private DateTime lastQtyBlockLogTime = DateTime.MinValue;
+        private DateTime lastEntryLineLogTime = DateTime.MinValue;
+        private const int EntryLineLogThrottleMs = 500;
 
         // Chart attachment state and suppression flags used while programmatically moving lines.
         private bool suppressLineEvents;
@@ -709,6 +713,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     lastSizingDebugStopTicks = double.NaN;
                     lastSizingDebugTargetTicks = double.NaN;
                     lastSizingDebugEntryRef = double.NaN;
+                    lastEntryFillPrice = 0;
+                    entryFillConfirmed = false;
                     userAdjustedStopWhileArmed = false;
                     userAdjustedTargetWhileArmed = false;
                     armedStopOffsetTicks = 0;
@@ -925,12 +931,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (order.OrderState == OrderState.Filled && (order.Name == tags.EntrySignalLong || order.Name == tags.EntrySignalShort))
                 {
                     avgEntryPrice = order.AverageFillPrice;
+                    double fillPrice = order.AverageFillPrice;
+                    if (fillPrice <= 0 && Position != null && Position.AveragePrice > 0)
+                        fillPrice = Position.AveragePrice;
+                    lastEntryFillPrice = fillPrice;
+                    entryFillConfirmed = fillPrice > 0;
                     hasPendingEntry = false;
                     armedDirection = ArmDirection.None;
                     isArmed = false;
                     StopBlinkTimer();
                     UpdateUiState();
-                    UpdateEntryLine(avgEntryPrice, "Entry fill");
+                    SafeExecuteUI("EntryLineFillUpdate", () => UpdateEntryLine(lastEntryFillPrice > 0 ? lastEntryFillPrice : avgEntryPrice, "Entry fill"));
                     RecordOrderAction($"Entry filled qty={order.Quantity} avg={avgEntryPrice:F2}");
                     LogInfo($"Entry filled @ {avgEntryPrice:F2} ({order.Quantity} contracts)");
 
@@ -1055,6 +1066,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     bracketIncompleteHandled = false;
                     avgEntryPrice = 0;
+                    lastEntryFillPrice = 0;
+                    entryFillConfirmed = false;
                     entryOrder = null;
                     stopOrder = null;
                     targetOrder = null;
@@ -1593,9 +1606,18 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Snap entry price to tick and mirror HUD label; used on fills and ARMED updates.
         private void UpdateEntryLine(double price, string reason)
         {
-            entryPrice = sizing.RoundToTick(price);
+            double prevEntry = entryPrice;
+            bool useFillPrice = entryFillConfirmed || (Position != null && Position.MarketPosition != MarketPosition.Flat);
+            double targetPrice = useFillPrice && lastEntryFillPrice > 0 ? lastEntryFillPrice : price;
+            entryPrice = sizing.RoundToTick(targetPrice);
             RiskRayHud.Snapshot snapshot = BuildHudSnapshot();
             chartLines.UpsertLine(RiskRayChartLines.LineKind.Entry, entryPrice, $"{hud.GetQtyLabel(snapshot)} ({reason})");
+            if (useFillPrice && lastEntryFillPrice > 0
+                && (DateTime.Now - lastEntryLineLogTime).TotalMilliseconds > EntryLineLogThrottleMs)
+            {
+                lastEntryLineLogTime = DateTime.Now;
+                LogDebug($"ENTRY_LINE updated to avgFill={lastEntryFillPrice:F2} prev={prevEntry:F2} mp={Position.MarketPosition} qty={Position.Quantity}");
+            }
         }
 
         #endregion
@@ -1697,6 +1719,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             currentOco = null;
             hasPendingEntry = false;
             avgEntryPrice = 0;
+            lastEntryFillPrice = 0;
+            entryFillConfirmed = false;
             processedExitIds.Clear();
             SetMilestone("ResetAndFlatten-End");
         }
@@ -1811,6 +1835,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             targetOrder = null;
             entryOrder = null;
             avgEntryPrice = 0;
+            lastEntryFillPrice = 0;
+            entryFillConfirmed = false;
             hasPendingEntry = false;
             processedExitIds.Clear();
             Disarm();
