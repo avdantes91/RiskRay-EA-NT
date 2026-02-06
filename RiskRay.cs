@@ -156,6 +156,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private readonly string instanceId = Guid.NewGuid().ToString("N").Substring(0, 6);
         private int stateChangeSeq = 0;
         private bool terminatedCleanupDone;
+        private bool terminationSummaryLogged;
+        private DateTime lastSizingDebugLogTime = DateTime.MinValue;
+        private int lastSizingDebugQty = int.MinValue;
+        private double lastSizingDebugStopTicks = double.NaN;
+        private double lastSizingDebugTargetTicks = double.NaN;
+        private double lastSizingDebugEntryRef = double.NaN;
+        private bool forceSizingDebugLog;
+        private const int SizingDebugThrottleMs = 250;
         private bool isRunningInstance;
         private bool userAdjustedStopWhileArmed;
         private bool userAdjustedTargetWhileArmed;
@@ -243,6 +251,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool DebugBlink { get; set; }
 
         [NinjaScriptProperty]
+        [Display(Name = "VerboseSizingDebug", Order = 19, GroupName = "Debug")]
+        public bool VerboseSizingDebug { get; set; }
+
+        [NinjaScriptProperty]
         [Display(Name = "OrderTagPrefix", Order = 10, GroupName = "RiskRay - IDs")]
         public string OrderTagPrefix { get; set; }
 
@@ -298,6 +310,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 selfCheckReason = null;
                 selfCheckDialogShown = false;
                 DebugBlink = false;
+                VerboseSizingDebug = false;
                 OrderTagPrefix = "RR_";
                 LabelOffsetMode = LabelOffsetModeOption.Legacy_TicksMax;
                 NotificationMode = NotificationModeOption.MessageBox;
@@ -307,6 +320,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastMilestoneTime = DateTime.MinValue;
                 fatalCount = 0;
                 terminatedCleanupDone = false;
+                terminationSummaryLogged = false;
+                forceSizingDebugLog = false;
+                lastSizingDebugLogTime = DateTime.MinValue;
+                lastSizingDebugQty = int.MinValue;
+                lastSizingDebugStopTicks = double.NaN;
+                lastSizingDebugTargetTicks = double.NaN;
+                lastSizingDebugEntryRef = double.NaN;
                 userAdjustedStopWhileArmed = false;
                 userAdjustedTargetWhileArmed = false;
                 armedStopOffsetTicks = 0;
@@ -342,9 +362,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Terminated)
             {
-                Print($"{Prefix("TRACE")} State.Terminated begin");
                 bool chartNull = ChartControl == null;
-                bool dispOk = ChartControl?.Dispatcher != null && !(ChartControl?.Dispatcher.HasShutdownStarted ?? true);
+                bool dispOk = CanTouchUi();
                 string reason = ClassifyTerminationReason(chartNull, dispOk);
                 SetMilestone("Terminated-Start");
                 try
@@ -358,8 +377,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     {
                         // UI thread is unavailable; release local refs only.
                         StopBlinkTimer();
-                        ReleaseUiReferencesNoDispatcher();
-                        RemoveAllDrawObjects();
+                        CleanupStateWithoutUi();
                         terminatedCleanupDone = true;
                         cleanupMode = "UISkipped";
                     }
@@ -371,17 +389,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                         terminatedCleanupDone = true;
                         cleanupMode = "UIExecuted";
                     }
-                    string level = fatalError ? "WARN" : "INFO";
-                    Print($"{Prefix(level)} Terminated reason={reason} cleanup={cleanupMode} chartNull={chartNull} dispatcherOk={dispOk} fatal={fatalError}");
-                    if (fatalError && !string.IsNullOrEmpty(fatalErrorMessage))
-                        Print($"{Prefix("WARN")} Terminated detail={fatalErrorMessage}");
-                    Print($"{Prefix("TRACE")} [State.Terminated] state={DescribeState()} milestone={lastMilestone} at={lastMilestoneTime:o} fatalCount={fatalCount}");
+                    if (!terminationSummaryLogged)
+                    {
+                        string level = fatalError ? "WARN" : "INFO";
+                        Print($"{Prefix(level)} Terminated reason={reason} cleanup={cleanupMode} chartNull={chartNull} dispatcherOk={dispOk} fatal={fatalError}");
+                        if (fatalError && !string.IsNullOrEmpty(fatalErrorMessage))
+                            Print($"{Prefix("WARN")} Terminated detail={fatalErrorMessage}");
+                        terminationSummaryLogged = true;
+                    }
                 }
                 catch (Exception ex)
                 {
                     LogFatal("OnStateChange.Terminated", ex);
                 }
-                Print($"{Prefix("TRACE")} State.Terminated end");
             }
         }
 
@@ -408,6 +428,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             return "StrategyDisabledOrReloaded";
         }
 
+        private bool CanTouchUi()
+        {
+            Dispatcher dispatcher = ChartControl?.Dispatcher;
+            return ChartControl != null && dispatcher != null && !dispatcher.HasShutdownStarted;
+        }
+
         private void ReleaseUiReferencesNoDispatcher()
         {
             chartEventsAttached = false;
@@ -419,6 +445,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             uiRoot = null;
             chartGrid = null;
             uiLoaded = false;
+        }
+
+        private void CleanupStateWithoutUi()
+        {
+            ReleaseUiReferencesNoDispatcher();
+            entryLineDirty = false;
+            stopLineDirty = false;
+            targetLineDirty = false;
+            ResetLabelTrackingCaches();
         }
 
         // Main tick handler in realtime: keeps entry line following bid/ask while armed and refreshes HUD without changing user-placed stops/targets.
@@ -855,6 +890,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void OnBuyClicked(object sender, RoutedEventArgs e)
         {
             LogInfo("UserClick: BUYARM");
+            forceSizingDebugLog = true;
             SafeExecute("OnBuyClicked", () =>
             {
                 if (Position.MarketPosition != MarketPosition.Flat || entryOrder != null)
@@ -878,6 +914,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void OnSellClicked(object sender, RoutedEventArgs e)
         {
             LogInfo("UserClick: SELLARM");
+            forceSizingDebugLog = true;
             SafeExecute("OnSellClicked", () =>
             {
                 if (Position.MarketPosition != MarketPosition.Flat || entryOrder != null)
@@ -903,6 +940,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             try
             {
                 LogInfo("UserClick: CLOSE");
+                forceSizingDebugLog = true;
                 Print($"{Prefix()} CLOSE click received");
                 ResetAndFlatten("UserClose");
             }
@@ -916,6 +954,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void OnBeClicked(object sender, RoutedEventArgs e)
         {
             LogInfo("UserClick: BE");
+            forceSizingDebugLog = true;
             SafeExecute("OnBeClicked", MoveStopToBreakEven);
         }
 
@@ -923,6 +962,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void OnTrailClicked(object sender, RoutedEventArgs e)
         {
             LogInfo("UserClick: TRAIL");
+            forceSizingDebugLog = true;
             SafeExecute("OnTrailClicked", ExecuteTrailStop);
         }
 
@@ -1187,11 +1227,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (isStop && !isDraggingStop)
             {
                 isDraggingStop = true;
+                forceSizingDebugLog = true;
                 LogDebugDrag("DragStart SL at", snapped);
             }
             else if (!isStop && !isDraggingTarget)
             {
                 isDraggingTarget = true;
+                forceSizingDebugLog = true;
                 LogDebugDrag("DragStart TP at", snapped);
             }
 
@@ -2241,6 +2283,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return;
                 }
                 MarkUserInteraction();
+                forceSizingDebugLog = true;
 
                 SetMilestone("FinalizeDrag-Start");
                 bool didLog = false;
@@ -2417,6 +2460,35 @@ namespace NinjaTrader.NinjaScript.Strategies
             if ((DateTime.Now - lastDebugLogTime).TotalSeconds < 1)
                 return false;
             lastDebugLogTime = DateTime.Now;
+            return true;
+        }
+
+        private bool ShouldLogSizingDebug(int qty, double stopTicks, double targetTicks, double entryRef, bool forceLog)
+        {
+            if (LogLevelSetting != LogLevelOption.Debug)
+                return false;
+
+            if (!forceLog && !VerboseSizingDebug)
+                return false;
+
+            DateTime now = DateTime.Now;
+            if (!forceLog && (now - lastSizingDebugLogTime).TotalMilliseconds < SizingDebugThrottleMs)
+                return false;
+
+            double entryThreshold = Math.Max(sizing.TickSize(), 0.0000001);
+            bool qtyChanged = qty != lastSizingDebugQty;
+            bool stopChanged = double.IsNaN(lastSizingDebugStopTicks) || Math.Abs(stopTicks - lastSizingDebugStopTicks) >= 0.5;
+            bool targetChanged = double.IsNaN(lastSizingDebugTargetTicks) || Math.Abs(targetTicks - lastSizingDebugTargetTicks) >= 0.5;
+            bool entryChanged = double.IsNaN(lastSizingDebugEntryRef) || Math.Abs(entryRef - lastSizingDebugEntryRef) >= entryThreshold;
+
+            if (!forceLog && !qtyChanged && !stopChanged && !targetChanged && !entryChanged)
+                return false;
+
+            lastSizingDebugLogTime = now;
+            lastSizingDebugQty = qty;
+            lastSizingDebugStopTicks = stopTicks;
+            lastSizingDebugTargetTicks = targetTicks;
+            lastSizingDebugEntryRef = entryRef;
             return true;
         }
 
