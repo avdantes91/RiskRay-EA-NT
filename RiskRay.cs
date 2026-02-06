@@ -336,6 +336,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 blinkTimer = null;
                 blinkTickHandler = null;
+                ResetBlinkState();
                 return;
             }
 
@@ -349,9 +350,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 blinkTimer.Stop();
                 blinkTimer = null;
                 blinkTickHandler = null;
+                ResetBlinkState();
                 host.SetMilestone("StopBlinkTimer");
                 host.LogInfo("Blink timer stopped");
             });
+        }
+
+        private void ResetBlinkState()
+        {
+            blinkOn = false;
+            blinkBuy = false;
+            blinkSell = false;
+            blinkTickCounter = 0;
         }
     }
 
@@ -844,15 +854,63 @@ namespace NinjaTrader.NinjaScript.Strategies
                 else if (order.Name == tags.TargetSignal)
                     targetOrder = order;
 
+                bool isEntryOrder = order.Name == tags.EntrySignalLong || order.Name == tags.EntrySignalShort;
+                if (isEntryOrder)
+                {
+                    if (order.OrderState == OrderState.Submitted)
+                        LogInfo($"Entry submitted: qty={order.Quantity}");
+                    else if ((order.OrderState == OrderState.Working || order.OrderState == OrderState.PartFilled) && order.Filled > 0)
+                        LogInfo($"Entry PartFilled: filled={order.Filled} qty={order.Quantity} avg={order.AverageFillPrice:F2} (bracket deferred until full fill)");
+                }
+
                 if (order.OrderState == OrderState.Filled && (order.Name == tags.EntrySignalLong || order.Name == tags.EntrySignalShort))
                 {
                     avgEntryPrice = order.AverageFillPrice;
                     hasPendingEntry = false;
                     armedDirection = ArmDirection.None;
                     isArmed = false;
+                    StopBlinkTimer();
                     UpdateUiState();
                     UpdateEntryLine(avgEntryPrice, "Entry fill");
                     LogInfo($"Entry filled @ {avgEntryPrice:F2} ({order.Quantity} contracts)");
+
+                    // Submit bracket only on full fill; exactly once per entry (idempotent: guard by no existing bracket).
+                    if (stopOrder == null && targetOrder == null)
+                    {
+                        if (!EnsureSelfCheckPassed())
+                            return;
+
+                        int qty = order.Quantity;
+                        if (qty <= 0)
+                        {
+                            LogInfo("Bracket skipped: entry fill qty<=0");
+                            return;
+                        }
+
+                        double stop = sizing.RoundToTick(stopPrice);
+                        double target = sizing.RoundToTick(targetPrice);
+                        if (double.IsNaN(stop) || double.IsInfinity(stop) || stop <= 0
+                            || double.IsNaN(target) || double.IsInfinity(target) || target <= 0)
+                        {
+                            Print($"{Prefix("WARN")} BracketPriceInvalid: stop={stop:F2} target={target:F2} -> flatten");
+                            FailSafeFlatten("BracketPriceInvalid");
+                            return;
+                        }
+
+                        OrderAction stopAction = order.OrderAction == OrderAction.Buy ? OrderAction.Sell : OrderAction.BuyToCover;
+                        OrderAction targetAction = stopAction;
+                        SafeExecute("SubmitExitBracket", () =>
+                        {
+                            currentOco = Guid.NewGuid().ToString("N");
+                            stopOrder = SubmitOrderUnmanaged(0, stopAction, OrderType.StopMarket, qty, 0, stop, currentOco, tags.StopSignal);
+                            targetOrder = SubmitOrderUnmanaged(0, targetAction, OrderType.Limit, qty, target, 0, currentOco, tags.TargetSignal);
+                        });
+                        LogInfo($"Bracket submitted (full fill): qty={qty}, SL={stop:F2}, TP={target:F2}");
+                    }
+                    else
+                    {
+                        LogDebug("Bracket already submitted, skip");
+                    }
                 }
 
                 if (order.OrderState == OrderState.Filled && (order.Name == tags.StopSignal || order.Name == tags.TargetSignal))
@@ -895,67 +953,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 bool isEntryExec = execution.Order.Name == tags.EntrySignalLong || execution.Order.Name == tags.EntrySignalShort;
                 if (isEntryExec)
                 {
+                    // Bracket is submitted only on full fill in OnOrderUpdate; do not submit or resize here.
                     avgEntryPrice = execution.Order.AverageFillPrice;
-                    if (!EnsureSelfCheckPassed())
-                        return;
-
-                    int openQty = Math.Abs(Position.Quantity);
-                    if (openQty <= 0)
-                        openQty = Math.Abs(execution.Quantity);
-                    if (openQty <= 0)
-                        return;
-
-                    double stop = sizing.RoundToTick(stopPrice);
-                    double target = sizing.RoundToTick(targetPrice);
-                    if (double.IsNaN(stop) || double.IsInfinity(stop) || stop <= 0
-                        || double.IsNaN(target) || double.IsInfinity(target) || target <= 0)
-                    {
-                        Print($"{Prefix("WARN")} BracketPriceInvalid: stop={stop:F2} target={target:F2} -> flatten");
-                        FailSafeFlatten("BracketPriceInvalid");
-                        return;
-                    }
-                    OrderAction stopAction = execution.Order.OrderAction == OrderAction.Buy ? OrderAction.Sell : OrderAction.BuyToCover;
-                    OrderAction targetAction = stopAction;
-                    if (stopOrder == null && targetOrder == null)
-                    {
-                        SafeExecute("SubmitExitBracket", () =>
-                        {
-                            currentOco = Guid.NewGuid().ToString("N");
-                            stopOrder = SubmitOrderUnmanaged(0, stopAction, OrderType.StopMarket, openQty, 0, stop, currentOco, tags.StopSignal);
-                            targetOrder = SubmitOrderUnmanaged(0, targetAction, OrderType.Limit, openQty, target, 0, currentOco, tags.TargetSignal);
-                        });
-                        LogInfo($"Bracket submitted on entry exec: qty {openQty}, SL {stop:F2}, TP {target:F2}");
-                    }
-                    else
-                    {
-                        bool resized = false;
-                        if (stopOrder != null && IsOrderActive(stopOrder) && stopOrder.Quantity != openQty)
-                        {
-                            if (IsOrderSafeForResize(stopOrder))
-                            {
-                                SafeExecute("ResizeStopOnFill", () => ChangeOrder(stopOrder, openQty, stopOrder.LimitPrice, stop));
-                                resized = true;
-                            }
-                            else
-                            {
-                                LogDebug($"ResizeStop skipped: state={stopOrder.OrderState}");
-                            }
-                        }
-                        if (targetOrder != null && IsOrderActive(targetOrder) && targetOrder.Quantity != openQty)
-                        {
-                            if (IsOrderSafeForResize(targetOrder))
-                            {
-                                SafeExecute("ResizeTargetOnFill", () => ChangeOrder(targetOrder, openQty, target, targetOrder.StopPrice));
-                                resized = true;
-                            }
-                            else
-                            {
-                                LogDebug($"ResizeTarget skipped: state={targetOrder.OrderState}");
-                            }
-                        }
-                        if (resized)
-                            LogDebug($"Bracket qty synced to {openQty} on entry exec");
-                    }
                 }
 
                 bool isExitExec = execution.Order.Name == tags.StopSignal || execution.Order.Name == tags.TargetSignal;
@@ -1175,6 +1174,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             isArmed = false;
             armedDirection = ArmDirection.None;
             hasPendingEntry = false;
+            StopBlinkTimer();
             LogDebug("Blink: disarmed -> stop blinking");
             isDraggingStop = false;
             isDraggingTarget = false;
