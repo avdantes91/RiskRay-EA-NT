@@ -1512,7 +1512,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 helpersInitLogged = true;
                 if (LogLevelSetting != LogLevelOption.Off)
-                    Print($"{Prefix("DEBUG")} Helpers initialized: prefixRaw='{(OrderTagPrefix ?? "<null>")}', prefixNorm='{normalizedPrefix}'");
+                    Print($"{Prefix("DEBUG")} Helpers initialized: orderPrefix='{normalizedPrefix}', drawPrefix='{normalizedPrefix}{instanceId}_', instanceId='{instanceId}'");
             }
         }
 
@@ -2474,35 +2474,42 @@ namespace NinjaTrader.NinjaScript.Strategies
         // even when external helper files are not in the active compile scope.
         private sealed class RiskRayTagNames
         {
-            private readonly string prefix;
+            private readonly string orderPrefix;
+            private readonly string drawPrefix;
 
             public RiskRayTagNames(string orderTagPrefix, string drawInstanceScope = null)
             {
                 string normalized = string.IsNullOrWhiteSpace(orderTagPrefix) ? "RR_" : orderTagPrefix.Trim();
-                prefix = string.IsNullOrWhiteSpace(normalized) ? "RR_" : normalized;
+                orderPrefix = string.IsNullOrWhiteSpace(normalized) ? "RR_" : normalized;
+                drawPrefix = string.IsNullOrWhiteSpace(drawInstanceScope) ? orderPrefix : $"{orderPrefix}{drawInstanceScope}_";
             }
 
-            public string Tag(string suffix)
+            private string OrderTag(string suffix)
             {
-                return $"{prefix}{suffix}";
+                return $"{orderPrefix}{suffix}";
             }
 
-            public string EntryLineTag => Tag("ENTRY_LINE");
-            public string StopLineTag => Tag("STOP_LINE");
-            public string TargetLineTag => Tag("TARGET_LINE");
+            private string DrawTag(string suffix)
+            {
+                return $"{drawPrefix}{suffix}";
+            }
 
-            public string EntryLabelTag => Tag("ENTRY_LABEL");
-            public string StopLabelTag => Tag("STOP_LABEL");
-            public string TargetLabelTag => Tag("TARGET_LABEL");
+            public string EntryLineTag => DrawTag("ENTRY_LINE");
+            public string StopLineTag => DrawTag("STOP_LINE");
+            public string TargetLineTag => DrawTag("TARGET_LINE");
 
-            public string EntrySignalLong => Tag("ENTRY_LONG");
-            public string EntrySignalShort => Tag("ENTRY_SHORT");
-            public string StopSignal => Tag("SL");
-            public string TargetSignal => Tag("TP");
-            public string CloseSignal => Tag("CLOSE");
-            public string BeSignal => Tag("BE");
-            public string TrailSignal => Tag("TRAIL");
-            public string HudNotifyTag => Tag("HUD_NOTIFY");
+            public string EntryLabelTag => DrawTag("ENTRY_LABEL");
+            public string StopLabelTag => DrawTag("STOP_LABEL");
+            public string TargetLabelTag => DrawTag("TARGET_LABEL");
+
+            public string EntrySignalLong => OrderTag("ENTRY_LONG");
+            public string EntrySignalShort => OrderTag("ENTRY_SHORT");
+            public string StopSignal => OrderTag("SL");
+            public string TargetSignal => OrderTag("TP");
+            public string CloseSignal => OrderTag("CLOSE");
+            public string BeSignal => OrderTag("BE");
+            public string TrailSignal => OrderTag("TRAIL");
+            public string HudNotifyTag => DrawTag("HUD_NOTIFY");
         }
 
         private sealed class RiskRaySizing
@@ -2706,9 +2713,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             public void RemoveAllDrawObjects()
             {
-                string normalizedPrefix = normalizedPrefixProvider != null ? normalizedPrefixProvider() : string.Empty;
                 WithSuppressedEvents(() =>
                 {
+                    // Multi-instance safety: never delete by prefix/wildcard because
+                    // instances can share OrderTagPrefix on the same chart.
                     HashSet<string> drawTags = new HashSet<string>();
                     drawTags.Add(tags.EntryLineTag);
                     drawTags.Add(tags.StopLineTag);
@@ -2725,9 +2733,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         string tagStr = obj.Tag.ToString();
                         if (string.IsNullOrEmpty(tagStr))
                             continue;
-
-                        if (tagStr.StartsWith(normalizedPrefix, StringComparison.Ordinal))
-                            drawTags.Add(tagStr);
+                        drawTags.Add(tagStr);
                     }
 
                     foreach (string tag in drawTags)
