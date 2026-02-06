@@ -19,7 +19,6 @@ using NinjaTrader.Gui;
 using NinjaTrader.Gui.Chart;
 using NinjaTrader.Gui.Tools;
 using NinjaTrader.NinjaScript;
-using NinjaTrader.NinjaScript.DrawingTools;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
@@ -78,11 +77,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool isArmed;
         private bool hasPendingEntry;
 
-        // Draw objects that mirror current entry/stop/target intentions.
-        private HorizontalLine entryLine;
-        private HorizontalLine stopLine;
-        private HorizontalLine targetLine;
-
         // Tracked prices for sizing and HUD labels.
         private double entryPrice;
         private double stopPrice;
@@ -105,8 +99,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool uiLoaded;
         private Grid chartGrid;
 
-        // Cached draw objects/labels to prevent leakage and redundant re-renders.
-        private readonly List<DrawingTool> trackedDrawObjects = new List<DrawingTool>();
+        // Cached draw state/labels to prevent leakage and redundant re-renders.
         private readonly HashSet<string> processedExitIds = new HashSet<string>();
         private bool entryLineDirty;
         private bool stopLineDirty;
@@ -131,12 +124,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lastDragMoveLogTarget = DateTime.MinValue;
         private DateTime lastLabelRefreshLogTime = DateTime.MinValue;
         private bool chartEventsAttached;
-        private string cachedEntryLabelText;
-        private string cachedStopLabelText;
-        private string cachedTargetLabelText;
-        private string cachedQtyLabelText;
-        private string cachedRrLabelText;
-        private DateTime lastLabelSkipLogTime = DateTime.MinValue;
         // Dialog/blink/self-check guards that throttle popups and enforce safety invariants.
         private bool isBeDialogOpen;
         private DateTime lastBeDialogTime = DateTime.MinValue;
@@ -161,8 +148,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool isRunningInstance;
         private RiskRayTagNames tags;
         private RiskRaySizing sizing;
+        private RiskRayChartLines chartLines;
+        private RiskRayHud hud;
         private bool helpersInitLogged;
-        private DateTime lastLabelTagLogTime = DateTime.MinValue;
 
         #endregion
 
@@ -308,6 +296,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 tags = null;
                 sizing = null;
+                chartLines = null;
+                hud = null;
             }
             else if (State == State.Historical)
             {
@@ -414,8 +404,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 receivedMarketDataThisSession = true;
 
                 UpdateEntryLineFromMarket();
-                ProcessLineDrag(stopLine, ref stopPrice, true);
-                ProcessLineDrag(targetLine, ref targetPrice, false);
+                ProcessLineDrag(RiskRayChartLines.LineKind.Stop, ref stopPrice, true);
+                ProcessLineDrag(RiskRayChartLines.LineKind.Target, ref targetPrice, false);
                 ApplyLineUpdates();
                 UpdateLabelsOnly();
             }
@@ -984,12 +974,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // Detect user drags on stop/target lines, clamp to valid prices, and push ChangeOrder when live orders exist.
-        private void ProcessLineDrag(HorizontalLine line, ref double trackedPrice, bool isStop)
+        private void ProcessLineDrag(RiskRayChartLines.LineKind kind, ref double trackedPrice, bool isStop)
         {
-            if (line == null || suppressLineEvents)
+            if (chartLines == null || suppressLineEvents)
                 return;
 
-            double? candidate = GetLinePrice(line);
+            double? candidate = chartLines.GetLinePrice(kind);
             if (candidate == null)
                 return;
 
@@ -1023,7 +1013,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (isStop)
             {
                 stopPrice = stop;
-                SetLinePrice(stopLine, stopPrice);
+                chartLines.SetLinePrice(RiskRayChartLines.LineKind.Stop, stopPrice);
                 stopLabelDirty = true;
                 LogDebugDrag("DragMove SL ->", stopPrice);
                 if (IsOrderActive(stopOrder) && Position.MarketPosition != MarketPosition.Flat && EnsureSelfCheckPassed())
@@ -1039,7 +1029,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else
             {
                 targetPrice = target;
-                SetLinePrice(targetLine, targetPrice);
+                chartLines.SetLinePrice(RiskRayChartLines.LineKind.Target, targetPrice);
                 targetLabelDirty = true;
                 LogDebugDrag("DragMove TP ->", targetPrice);
                 if (targetOrder != null && targetOrder.OrderState == OrderState.Working && EnsureSelfCheckPassed())
@@ -1056,94 +1046,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void UpdateEntryLine(double price, string reason)
         {
             entryPrice = sizing.RoundToTick(price);
-            CreateOrUpdateEntryLine(entryPrice, $"{GetQtyLabel()} ({reason})");
-        }
-
-        // Create/update entry line + label while suppressing drag callbacks.
-        private void CreateOrUpdateEntryLine(double price, string label)
-        {
-            bool previousSuppress = suppressLineEvents;
-            suppressLineEvents = true;
-            try
-            {
-                if (entryLine == null)
-                {
-                    entryLine = Draw.HorizontalLine(this, tags.EntryLineTag, price, Brushes.Black);
-                    if (entryLine != null)
-                    {
-                        entryLine.Stroke = new Stroke(Brushes.Black, DashStyleHelper.Solid, 2);
-                        entryLine.IsLocked = true;
-                        TrackDrawObject(entryLine);
-                    }
-                }
-                else
-                {
-                    SetLinePrice(entryLine, price);
-                }
-                CreateOrUpdateLabel(tags.EntryLabelTag, price, label, Brushes.Black);
-            }
-            finally
-            {
-                suppressLineEvents = previousSuppress;
-            }
-        }
-
-        // Create/update stop line; remains draggable so ChangeOrder can pick up user edits.
-        private void CreateOrUpdateStopLine(double price, string label)
-        {
-            bool previousSuppress = suppressLineEvents;
-            suppressLineEvents = true;
-            try
-            {
-                if (stopLine == null)
-                {
-                    stopLine = Draw.HorizontalLine(this, tags.StopLineTag, price, Brushes.Red);
-                    if (stopLine != null)
-                    {
-                        stopLine.Stroke = new Stroke(Brushes.Red, DashStyleHelper.Solid, 2);
-                        stopLine.IsLocked = false;
-                        TrackDrawObject(stopLine);
-                    }
-                }
-                else
-                {
-                    SetLinePrice(stopLine, price);
-                }
-                CreateOrUpdateLabel(tags.StopLabelTag, price, label, Brushes.Red);
-            }
-            finally
-            {
-                suppressLineEvents = previousSuppress;
-            }
-        }
-
-        // Create/update target line with unlocked drag behavior for user adjustments.
-        private void CreateOrUpdateTargetLine(double price, string label)
-        {
-            bool previousSuppress = suppressLineEvents;
-            suppressLineEvents = true;
-            try
-            {
-                if (targetLine == null)
-                {
-                    targetLine = Draw.HorizontalLine(this, tags.TargetLineTag, price, Brushes.ForestGreen);
-                    if (targetLine != null)
-                    {
-                        targetLine.Stroke = new Stroke(Brushes.ForestGreen, DashStyleHelper.Solid, 2);
-                        targetLine.IsLocked = false;
-                        TrackDrawObject(targetLine);
-                    }
-                }
-                else
-                {
-                    SetLinePrice(targetLine, price);
-                }
-                CreateOrUpdateLabel(tags.TargetLabelTag, price, label, Brushes.ForestGreen);
-            }
-            finally
-            {
-                suppressLineEvents = previousSuppress;
-            }
+            RiskRayHud.Snapshot snapshot = BuildHudSnapshot();
+            chartLines.UpsertLine(RiskRayChartLines.LineKind.Entry, entryPrice, $"{hud.GetQtyLabel(snapshot)} ({reason})");
         }
 
         #endregion
@@ -1319,7 +1223,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             newStop = sizing.RoundToTick(newStop);
             stopPrice = newStop;
-            SetLinePrice(stopLine, stopPrice);
+            chartLines.SetLinePrice(RiskRayChartLines.LineKind.Stop, stopPrice);
             stopLineDirty = false;
 
             if (IsOrderActive(stopOrder))
@@ -1388,6 +1292,38 @@ namespace NinjaTrader.NinjaScript.Strategies
                 sizing = new RiskRaySizing(() => Instrument, () => cachedTickSize, v => cachedTickSize = v);
                 created = true;
             }
+            if (hud == null)
+            {
+                hud = new RiskRayHud(
+                    sizing,
+                    () => Instrument,
+                    GetEntryReferenceForRisk,
+                    GetDisplayQuantity,
+                    CurrencySymbol);
+                created = true;
+            }
+            if (chartLines == null)
+            {
+                chartLines = new RiskRayChartLines(
+                    this,
+                    tags,
+                    () => sizing.TickSize(),
+                    price => sizing.RoundToTick(price),
+                    GetWorkingDirection,
+                    GetLabelBarsAgo,
+                    GetLabelOffsetTicks,
+                    () => suppressLineEvents,
+                    value => suppressLineEvents = value,
+                    NormalizedPrefix,
+                    message =>
+                    {
+                        if ((DateTime.Now - lastCleanupLogTime).TotalSeconds < 1)
+                            return;
+                        lastCleanupLogTime = DateTime.Now;
+                        Print($"{Prefix()} Draw cleanup skipped: {message}");
+                    });
+                created = true;
+            }
             if (created && !helpersInitLogged)
             {
                 helpersInitLogged = true;
@@ -1407,14 +1343,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (armedDirection == ArmDirection.Short)
                 return MarketPosition.Short;
             return MarketPosition.Flat;
-        }
-
-        // Safe accessor for draggable line anchor prices.
-        private double? GetLinePrice(HorizontalLine line)
-        {
-            if (line == null || line.StartAnchor == null)
-                return null;
-            return line.StartAnchor.Price;
         }
 
         // Entry reference defaults to last close unless configured to follow bid/ask for tighter arming.
@@ -1455,19 +1383,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Only move lines when their tracked price changed; avoids ticking redraws that used to override user drags.
             if (entryLineDirty)
             {
-                CreateOrUpdateEntryLine(entryPrice, GetQtyLabel());
+                chartLines.UpsertLine(RiskRayChartLines.LineKind.Entry, entryPrice, hud.GetQtyLabel(BuildHudSnapshot()));
                 entryLineDirty = false;
             }
 
             if (stopLineDirty && !isDraggingStop)
             {
-                CreateOrUpdateStopLine(stopPrice, GetStopLabel());
+                chartLines.UpsertLine(RiskRayChartLines.LineKind.Stop, stopPrice, hud.GetStopLabel(BuildHudSnapshot()));
                 stopLineDirty = false;
             }
 
             if (targetLineDirty && !isDraggingTarget)
             {
-                CreateOrUpdateTargetLine(targetPrice, GetTargetLabel());
+                chartLines.UpsertLine(RiskRayChartLines.LineKind.Target, targetPrice, hud.GetTargetLabel(BuildHudSnapshot()));
                 targetLineDirty = false;
             }
         }
@@ -1476,12 +1404,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void UpdateLabelsOnly()
         {
             EnsureHelpers();
-            if (!HasActiveLines())
+            if (!chartLines.HasActiveLines())
                 return;
 
-            string entryLabel = GetEntryLabelSafe();
-            string stopLbl = GetStopLabel();
-            string targetLbl = GetTargetLabel();
+            RiskRayHud.Snapshot snapshot = BuildHudSnapshot();
+            string entryLabel = hud.GetEntryLabelSafe(snapshot);
+            string stopLbl = hud.GetStopLabel(snapshot);
+            string targetLbl = hud.GetTargetLabel(snapshot);
             double priceTolerance = Math.Max(sizing.TickSize() / 8, 0.0000001);
 
             bool entryPriceMoved = HasLabelPriceMoved(entryPrice, lastEntryLabelPrice, priceTolerance);
@@ -1492,7 +1421,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (entryLabelDirty || entryTextChanged || entryPriceMoved)
             {
                 double oldEntryPrice = lastEntryLabelPrice;
-                CreateOrUpdateLabel(tags.EntryLabelTag, entryPrice, entryLabel, Brushes.Black);
+                chartLines.UpsertLine(RiskRayChartLines.LineKind.Entry, entryPrice, entryLabel);
                 lastEntryLabel = entryLabel;
                 lastEntryLabelPrice = entryPrice;
                 entryLabelDirty = false;
@@ -1503,7 +1432,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (stopLabelDirty || stopTextChanged || stopPriceMoved)
             {
                 double oldStopPrice = lastStopLabelPrice;
-                CreateOrUpdateLabel(tags.StopLabelTag, stopPrice, stopLbl, Brushes.Red);
+                chartLines.UpsertLine(RiskRayChartLines.LineKind.Stop, stopPrice, stopLbl);
                 lastStopLabel = stopLbl;
                 lastStopLabelPrice = stopPrice;
                 stopLabelDirty = false;
@@ -1514,11 +1443,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (targetLabelDirty || targetTextChanged || targetPriceMoved)
             {
                 double oldTargetPrice = lastTargetLabelPrice;
-                CreateOrUpdateLabel(tags.TargetLabelTag, targetPrice, targetLbl, Brushes.ForestGreen);
+                chartLines.UpsertLine(RiskRayChartLines.LineKind.Target, targetPrice, targetLbl);
                 lastTargetLabel = targetLbl;
                 lastTargetLabelPrice = targetPrice;
                 targetLabelDirty = false;
                 LogLabelRefresh("TP", targetTextChanged, targetPriceMoved, oldTargetPrice, targetPrice);
+            }
+
+            if (DebugBlink && hud.TryComputeSizing(snapshot, out double tickDbg, out double tickValueDbg, out double entryRefDbg, out _))
+            {
+                double rewardTicksDbg = tickDbg > 0 ? Math.Abs(targetPrice - entryRefDbg) / tickDbg : 0;
+                double rewardQtyDbg = Math.Max(1, GetDisplayQuantity());
+                double rewardDbg = rewardTicksDbg * tickValueDbg * rewardQtyDbg;
+                string ptsTicksDbg = "CALC…";
+                int open = targetLbl.LastIndexOf('(');
+                int close = targetLbl.LastIndexOf(')');
+                if (open >= 0 && close > open + 1)
+                    ptsTicksDbg = targetLbl.Substring(open + 1, close - open - 1);
+                Print($"{Prefix("DEBUG")} TP label -> $={rewardDbg:F2}, targetTicks={rewardTicksDbg:F1}, ptsTicks={ptsTicksDbg}");
             }
 
             if (LogLevelSetting == LogLevelOption.Debug && ShouldLogDebug())
@@ -1530,6 +1472,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double targetTicks = tick > 0 ? Math.Abs(targetPrice - entryRef) / tick : 0;
                 LogDebug($"Sizing: qty {qty}, stopTicks {stopTicks:F1}, targetTicks {targetTicks:F1}, entryPrice={entryPrice:F2}, stopPrice={stopPrice:F2}, targetPrice={targetPrice:F2}, entryRef={entryRef:F2}");
             }
+        }
+
+        private RiskRayHud.Snapshot BuildHudSnapshot()
+        {
+            return new RiskRayHud.Snapshot(
+                entryPrice,
+                stopPrice,
+                targetPrice,
+                FixedRiskUSD,
+                CommissionMode == CommissionModeOption.On,
+                CommissionPerContractRoundTurn,
+                MaxContracts,
+                MaxRiskWarningUSD);
         }
 
         private bool HasLabelPriceMoved(double currentPrice, double previousPrice, double tolerance)
@@ -1565,204 +1520,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             LogDebug($"Label redraw {lineName}: {reason}, oldPrice={oldText}, newPrice={newPrice:F2}");
         }
 
-        // Entry label merges qty + RR, falling back to cached text when sizing temporarily unavailable.
-        private string GetEntryLabelSafe()
-        {
-            string qtyLabel = GetQtyLabel();
-            string rrText = GetRiskRewardText();
-            string combined;
-            if (string.IsNullOrEmpty(qtyLabel) || qtyLabel == "0 contracts")
-                qtyLabel = cachedQtyLabelText ?? "CALC…";
-
-            if (string.IsNullOrEmpty(rrText) || rrText == "R0.00" || rrText == "R—")
-                rrText = cachedRrLabelText ?? "R?";
-
-            combined = $"{qtyLabel} | {rrText}";
-            cachedEntryLabelText = combined;
-            return combined;
-        }
-
-        // Computes display quantity text using cached placeholder when sizing inputs invalid.
-        private string GetQtyLabel()
-        {
-            if (!TryComputeSizing(out double tick, out double tickValue, out double entryRef, out string reason))
-            {
-                return UseCachedOrPlaceholder(ref cachedQtyLabelText, reason);
-            }
-
-            double stopTicks = Math.Abs(entryPrice - stopPrice) / tick;
-            double perContractRisk = (stopTicks * tickValue) + (CommissionMode == CommissionModeOption.On ? CommissionPerContractRoundTurn : 0);
-            double rawQty = perContractRisk > 0 ? FixedRiskUSD / perContractRisk : 0;
-            int roundedQty = (int)Math.Floor(rawQty + 0.5);
-            int cappedQty = Math.Min(roundedQty, MaxContracts);
-
-            string label;
-            if (cappedQty < 1)
-                label = $"{rawQty:F2} (min 1)";
-            else
-                label = $"{cappedQty} contracts";
-
-            cachedQtyLabelText = label;
-            return label;
-        }
-
-        // Stop label displays currency risk and distance; warns when over MaxRiskWarningUSD threshold.
-        private string GetStopLabel()
-        {
-            if (!TryComputeSizing(out double tick, out double tickValue, out double entryRef, out string reason))
-                return UseCachedOrPlaceholder(ref cachedStopLabelText, reason);
-
-            double stopDistanceTicks = Math.Abs(entryRef - stopPrice) / tick;
-            if (double.IsNaN(stopDistanceTicks) || double.IsInfinity(stopDistanceTicks))
-                return UseCachedOrPlaceholder(ref cachedStopLabelText, "stop distance invalid");
-
-            if (stopDistanceTicks <= double.Epsilon)
-            {
-                cachedStopLabelText = "SL: BE";
-                return cachedStopLabelText;
-            }
-
-            double perContractRisk = (stopDistanceTicks * tickValue) + (CommissionMode == CommissionModeOption.On ? CommissionPerContractRoundTurn : 0);
-            // Use at least 1 contract for display risk to avoid showing $0 when qty is blocked.
-            double riskQty = Math.Max(1, GetDisplayQuantity());
-            double totalRisk = perContractRisk * riskQty;
-            string distanceText = FormatPointsAndTicks(stopDistanceTicks);
-            string label = $"SL: -{CurrencySymbol()}{totalRisk:F2} ({distanceText})";
-            // Legacy templates carried a 200 default warning; if user raised FixedRiskUSD above that, treat 200 as legacy and follow FixedRiskUSD instead.
-            const double legacyWarn = 200d;
-            double effectiveWarn = MaxRiskWarningUSD > 0 ? MaxRiskWarningUSD : FixedRiskUSD;
-            if (MaxRiskWarningUSD > 0
-                && Math.Abs(MaxRiskWarningUSD - legacyWarn) < 0.0001
-                && Math.Abs(FixedRiskUSD - legacyWarn) > 0.0001)
-            {
-                effectiveWarn = FixedRiskUSD;
-            }
-            if (LogLevelSetting == LogLevelOption.Debug && ShouldLogDebug())
-                LogDebug($"StopWarn eval: stopTicks={stopDistanceTicks:F1} tickValue={tickValue:F4} displayQty={riskQty} totalRisk={totalRisk:F2} warn={effectiveWarn:F2}");
-            if (totalRisk > effectiveWarn)
-                label = $"!! {label} !!";
-            cachedStopLabelText = label;
-            return label;
-        }
-
-        // Target label shows reward estimate; reused cached placeholder if sizing unavailable.
-        private string GetTargetLabel()
-        {
-            if (!TryComputeSizing(out double tick, out double tickValue, out double entryRef, out string reason))
-                return UseCachedOrPlaceholder(ref cachedTargetLabelText, reason);
-
-            double rewardTicks = Math.Abs(targetPrice - entryRef) / tick;
-            if (double.IsNaN(rewardTicks) || double.IsInfinity(rewardTicks))
-                return UseCachedOrPlaceholder(ref cachedTargetLabelText, "reward distance invalid");
-
-            double rewardQty = Math.Max(1, GetDisplayQuantity());
-            double reward = rewardTicks * tickValue * rewardQty;
-            string ptsTicks = FormatPointsAndTicks(rewardTicks);
-            string label = $"TP: +{CurrencySymbol()}{reward:F2} ({ptsTicks})";
-            if (DebugBlink)
-                Print($"{Prefix("DEBUG")} TP label -> $={reward:F2}, targetTicks={rewardTicks:F1}, ptsTicks={ptsTicks}");
-            cachedTargetLabelText = label;
-            return label;
-        }
-
-        // Computes R multiple for HUD; caches last known value if sizing inputs invalid.
-        private string GetRiskRewardText()
-        {
-            if (!TryComputeSizing(out double tick, out _, out double entryRef, out string reason))
-                return UseCachedOrPlaceholder(ref cachedRrLabelText, reason);
-
-            double stopTicks = Math.Abs(entryRef - stopPrice) / tick;
-            double rewardTicks = Math.Abs(targetPrice - entryRef) / tick;
-            if (stopTicks <= double.Epsilon || double.IsNaN(stopTicks) || double.IsInfinity(stopTicks))
-                return UseCachedOrPlaceholder(ref cachedRrLabelText, "stop ticks invalid");
-
-            double rr = rewardTicks / stopTicks;
-            string rrText;
-            if (Math.Abs(rr - 1.0) < 0.005)
-                rrText = "R1";
-            else
-                rrText = $"R{rr:F2}";
-
-            cachedRrLabelText = rrText;
-            return rrText;
-        }
-
-        // Utility to compute stop distance in ticks for sizing; returns NaN when instrument info missing.
-        private double GetStopDistanceTicks(double entryRef)
-        {
-            double tick = sizing.TickSize();
-            if (tick <= 0 || double.IsNaN(entryRef) || double.IsInfinity(entryRef))
-                return double.NaN;
-            return Math.Abs(entryRef - stopPrice) / tick;
-        }
-
-        // Validates tick metadata + entry reference before sizing; prevents downstream NaNs and blocks orders when invalid.
-        private bool TryComputeSizing(out double tick, out double tickValue, out double entryRef, out string reason)
-        {
-            tick = sizing.TickSize();
-            tickValue = sizing.TickValue();
-            entryRef = double.NaN;
-
-            if (Instrument == null || Instrument.MasterInstrument == null)
-            {
-                reason = "instrument missing";
-                return false;
-            }
-            if (tick <= 0 || double.IsNaN(tick) || double.IsInfinity(tick))
-            {
-                reason = "TickSize<=0";
-                return false;
-            }
-            if (tickValue <= 0 || double.IsNaN(tickValue) || double.IsInfinity(tickValue))
-            {
-                reason = "TickValue<=0";
-                return false;
-            }
-            if (tick > 0)
-                cachedTickSize = tick;
-
-            entryRef = GetEntryReferenceForRisk();
-            if (double.IsNaN(entryRef) || double.IsInfinity(entryRef) || entryRef <= 0)
-            {
-                reason = "entryRef invalid";
-                return false;
-            }
-
-            reason = null;
-            return true;
-        }
-
-        // Uses cached HUD text or placeholder while logging skips throttled to avoid spam.
-        private string UseCachedOrPlaceholder(ref string cache, string reason)
-        {
-            if (ShouldLogLabelSkip())
-                LogDebug($"Label update skipped: {reason}");
-            if (!string.IsNullOrEmpty(cache))
-                return cache;
-            return "CALC…";
-        }
-
-        // Converts tick distance into points.ticks format for concise HUD display.
-        private string FormatPointsAndTicks(double stopDistanceTicks)
-        {
-            // Append stop distance as points.ticks (e.g., 20.3 where .3 = ticks past whole point)
-            double tick = sizing.TickSize();
-            if (tick <= 0 || double.IsNaN(stopDistanceTicks) || double.IsInfinity(stopDistanceTicks))
-                return "CALC…";
-
-            double stopPoints = stopDistanceTicks * tick;
-            double wholePoints = Math.Floor(stopPoints + 1e-9);
-            int ticksPerPoint = Math.Max(1, (int)Math.Round(1.0 / tick));
-            int remainingTicks = (int)Math.Round((stopPoints - wholePoints) / tick);
-            remainingTicks = Math.Max(0, Math.Min(remainingTicks, ticksPerPoint - 1));
-            if (remainingTicks >= ticksPerPoint)
-            {
-                wholePoints += 1;
-                remainingTicks = 0;
-            }
-            return $"{wholePoints}.{remainingTicks}";
-        }
-
         // Places labels a set distance to the right while clamping to sane bounds for visibility.
         private int GetLabelBarsAgo()
         {
@@ -1789,61 +1546,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // Draws or updates text labels with directional offsets; assumes dispatcher-safe context.
-        private void CreateOrUpdateLabel(string tag, double price, string text, Brush brush)
-        {
-            EnsureHelpers();
-            if (LogLevelSetting == LogLevelOption.Debug && (DateTime.Now - lastLabelTagLogTime).TotalSeconds >= 1)
-            {
-                lastLabelTagLogTime = DateTime.Now;
-                Print($"{Prefix("DEBUG")} LabelTag {tag}");
-            }
-            // Offset in ticks, scaled up using pixel preference (fallback tick-based approach for NT8 compatibility).
-            double offsetTicks = GetLabelOffsetTicks();
-            MarketPosition dir = GetWorkingDirection();
-            bool isStop = tag == tags.StopLabelTag;
-
-            double offsetPrice = price;
-            if (dir == MarketPosition.Long)
-                offsetPrice = isStop ? price - offsetTicks * sizing.TickSize() : price + offsetTicks * sizing.TickSize();
-            else if (dir == MarketPosition.Short)
-                offsetPrice = isStop ? price + offsetTicks * sizing.TickSize() : price - offsetTicks * sizing.TickSize();
-
-            offsetPrice = sizing.RoundToTick(offsetPrice);
-
-            // Force deterministic replacement to prevent ghost/stuck labels when Draw.Text doesn't overwrite.
-            TryRemoveDrawObject(tag);
-            int barsAgo = GetLabelBarsAgo();
-            var label = Draw.Text(this, tag, text, barsAgo, offsetPrice, brush);
-            if (label != null)
-                TrackDrawObject(label);
-        }
-
         #endregion
 
         #endregion
 
         #region Lines/Draw Objects (helpers)
-
-        // Update helper: set both anchors while suppressing drag events.
-        private void SetLinePrice(HorizontalLine line, double price)
-        {
-            if (line == null)
-                return;
-            bool previousSuppress = suppressLineEvents;
-            suppressLineEvents = true;
-            try
-            {
-                if (line.StartAnchor != null)
-                    line.StartAnchor.Price = price;
-                if (line.EndAnchor != null)
-                    line.EndAnchor.Price = price;
-            }
-            finally
-            {
-                suppressLineEvents = previousSuppress;
-            }
-        }
 
         // Clamp stop/target to stay one tick off current bid/ask; protects unmanaged orders from instantly triggering.
         private void EnforceValidity(MarketPosition direction, ref double stop, ref double target, out bool clamped)
@@ -1902,11 +1609,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             entryLabelDirty = true;
             stopLabelDirty = true;
             targetLabelDirty = true;
-            cachedEntryLabelText = null;
-            cachedStopLabelText = null;
-            cachedTargetLabelText = null;
-            cachedQtyLabelText = null;
-            cachedRrLabelText = null;
+            hud?.ResetCaches();
         }
 
         // Remove all strategy-owned draw objects and reset caches; used on disarm and cleanup.
@@ -1914,72 +1617,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             EnsureHelpers();
             SetMilestone("RemoveAllDrawObjects-Start");
-            string normalizedPrefix = NormalizedPrefix();
-            bool previousSuppress = suppressLineEvents;
-            suppressLineEvents = true;
-            try
-            {
-                var drawTags = new HashSet<string>();
-                drawTags.Add(tags.EntryLineTag);
-                drawTags.Add(tags.StopLineTag);
-                drawTags.Add(tags.TargetLineTag);
-                drawTags.Add(tags.EntryLabelTag);
-                drawTags.Add(tags.StopLabelTag);
-                drawTags.Add(tags.TargetLabelTag);
-                foreach (var obj in trackedDrawObjects)
-                {
-                    if (obj != null && obj.Tag != null)
-                    {
-                        string tagStr = obj.Tag.ToString();
-                        if (!string.IsNullOrEmpty(tagStr) && tagStr.StartsWith(normalizedPrefix, StringComparison.Ordinal))
-                            drawTags.Add(tagStr);
-                    }
-                }
-                foreach (var tag in drawTags)
-                    TryRemoveDrawObject(tag);
-                trackedDrawObjects.Clear();
-                entryLine = null;
-                stopLine = null;
-                targetLine = null;
-                entryLineDirty = false;
-                stopLineDirty = false;
-                targetLineDirty = false;
-                ResetLabelTrackingCaches();
-            }
-            finally
-            {
-                suppressLineEvents = previousSuppress;
-            }
+            chartLines?.RemoveAllDrawObjects();
+            entryLineDirty = false;
+            stopLineDirty = false;
+            targetLineDirty = false;
+            ResetLabelTrackingCaches();
             SetMilestone("RemoveAllDrawObjects-End");
-        }
-
-        // Track draw objects to avoid duplicates and simplify cleanup.
-        private void TrackDrawObject(DrawingTool obj)
-        {
-            if (obj == null)
-                return;
-
-            trackedDrawObjects.RemoveAll(o => o != null && o.Tag == obj.Tag);
-            trackedDrawObjects.Add(obj);
-        }
-
-        // Type-safe removal helper; convert tags to string to satisfy RemoveDrawObject signature.
-        private void TryRemoveDrawObject(string tag)
-        {
-            if (tag == null)
-                return;
-            try
-            {
-                RemoveDrawObject(tag);
-            }
-            catch (Exception ex)
-            {
-                if ((DateTime.Now - lastCleanupLogTime).TotalSeconds >= 1)
-                {
-                    lastCleanupLogTime = DateTime.Now;
-                    Print($"{Prefix()} Draw cleanup skipped: {ex.Message}");
-                }
-            }
         }
 
         #endregion
@@ -2217,8 +1860,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     EnforceValidity(GetWorkingDirection(), ref stop, ref target, out clamped);
                     stopPrice = stop;
                     targetPrice = target;
-                    SetLinePrice(stopLine, stopPrice);
-                    SetLinePrice(targetLine, targetPrice);
+                    if (chartLines != null)
+                    {
+                        chartLines.SetLinePrice(RiskRayChartLines.LineKind.Stop, stopPrice);
+                        chartLines.SetLinePrice(RiskRayChartLines.LineKind.Target, targetPrice);
+                    }
                     stopLineDirty = false;
                     targetLineDirty = false;
                     stopLabelDirty = true;
@@ -2270,9 +1916,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if ((DateTime.Now - lastHudMessageTime).TotalSeconds < 0.5)
                     return;
                 lastHudMessageTime = DateTime.Now;
-                var note = Draw.TextFixed(this, tags.HudNotifyTag, $"{title}: {message}", TextPosition.TopRight, Brushes.White, new SimpleFont("Segoe UI", 13), Brushes.Black, Brushes.White, 4, DashStyleHelper.Solid, 1, false, null);
-                if (note != null)
-                    TrackDrawObject(note);
+                chartLines.ShowHudNotification($"{title}: {message}");
                 return;
             }
 
@@ -2433,22 +2077,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             ShowNotification("RiskRay - Self-check", $"RiskRay Self-check failed: {selfCheckReason}. Orders are blocked until fixed. Check instrument settings and restart the strategy.");
         }
 
-        // Prevent label skip logs from spamming more than once per second.
-        private bool ShouldLogLabelSkip()
-        {
-            if ((DateTime.Now - lastLabelSkipLogTime).TotalSeconds < 1)
-                return false;
-            lastLabelSkipLogTime = DateTime.Now;
-            return true;
-        }
-
         #endregion
-
-        // Quick helper to see if HUD elements exist; used to skip unnecessary updates.
-        private bool HasActiveLines()
-        {
-            return entryLine != null || stopLine != null || targetLine != null;
-        }
 
         // Human-readable state for logs; preserves fatal flag even when positions exist.
         private string DescribeState()
