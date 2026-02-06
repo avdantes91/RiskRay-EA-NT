@@ -492,6 +492,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool fatalNotified;
         private DateTime lastFatalGuardLogTime = DateTime.MinValue;
         private const int FatalGuardLogThrottleMs = 2000;
+        private DateTime lastHotFuseLogTime = DateTime.MinValue;
+        private const int HotFuseLogThrottleMs = 2000;
         private DateTime lastHudMessageTime = DateTime.MinValue;
         private readonly string instanceId = Guid.NewGuid().ToString("N").Substring(0, 6);
         private int stateChangeSeq = 0;
@@ -1025,7 +1027,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (Position.MarketPosition != MarketPosition.Flat && (stopActive ^ targetActive))
                     {
                         if (!bracketIncompleteHandled)
+                        {
+                            bracketIncompleteHandled = true;
+                            if (fatalError)
+                            {
+                                HandleBracketIncompleteDuringFatal("BracketIncomplete");
+                                return;
+                            }
                             LogDiagnosticSnapshot("BracketIncomplete");
+                        }
                         FailSafeFlatten("BracketIncomplete");
                     }
                 }
@@ -2581,6 +2591,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             Print($"{Prefix("WARN")} Diagnostic snapshot ({reason}):\n{snapshot}");
         }
 
+        private void HandleBracketIncompleteDuringFatal(string reason)
+        {
+            LogDiagnosticSnapshot(reason);
+            if ((DateTime.Now - lastHotFuseLogTime).TotalMilliseconds < HotFuseLogThrottleMs)
+                return;
+            lastHotFuseLogTime = DateTime.Now;
+            string message = "Bracket incomplete (stop XOR target). Strategy is in FATAL mode (Variant A). " +
+                             "Trading actions are disabled by design. Close position manually and verify SL/TP on broker.";
+            LogInfo(message);
+            RecordOrderAction($"HOT_FUSE {reason} fatal");
+            RecordDiagEvent($"HOT_FUSE {reason}");
+            if (!uiUnavailablePermanently)
+                NotifyFatalOnce(message);
+        }
+
         // Level-gated info logger for user actions and state transitions.
         private void LogInfo(string message)
         {
@@ -2625,7 +2650,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             if ((DateTime.Now - lastFatalGuardLogTime).TotalMilliseconds < FatalGuardLogThrottleMs)
                 return;
             lastFatalGuardLogTime = DateTime.Now;
-            LogInfo($"Fatal mode: skipped trade action {scope}");
+            LogInfo($"Fatal error: trading actions disabled. Close position manually. (skip {scope})");
+            RecordOrderAction($"SKIP {scope} fatal");
             RecordDiagEvent($"FATAL_GUARD {scope}");
         }
 
@@ -2686,6 +2712,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (uiUnavailablePermanently)
                 return;
+            bool dispatcherOk = ChartControl != null && ChartControl.Dispatcher != null && !ChartControl.Dispatcher.HasShutdownStarted;
+            if (!dispatcherOk)
+            {
+                LogUiAvailabilityOnce(scope, ChartControl == null, dispatcherOk);
+                return;
+            }
             if (action == null)
                 return;
             try
@@ -2696,9 +2728,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 RecordException($"UI.{scope}", ex, false);
                 LogUiError(scope, ex);
-                bool dispatcherOk = CanTouchUi();
-                if (!dispatcherOk || ex is InvalidOperationException)
-                    LogUiAvailabilityOnce(scope, ChartControl == null, dispatcherOk);
+                bool canTouchUi = CanTouchUi();
+                if (!canTouchUi)
+                    LogUiAvailabilityOnce(scope, ChartControl == null, canTouchUi);
             }
         }
 
