@@ -113,12 +113,19 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string lastEntryLabel;
         private string lastStopLabel;
         private string lastTargetLabel;
+        private double lastEntryLabelPrice = double.NaN;
+        private double lastStopLabelPrice = double.NaN;
+        private double lastTargetLabelPrice = double.NaN;
+        private bool entryLabelDirty = true;
+        private bool stopLabelDirty = true;
+        private bool targetLabelDirty = true;
         private bool fatalError;
         private string fatalErrorMessage;
         private bool isDraggingStop;
         private bool isDraggingTarget;
         private DateTime lastDragMoveLogStop = DateTime.MinValue;
         private DateTime lastDragMoveLogTarget = DateTime.MinValue;
+        private DateTime lastLabelRefreshLogTime = DateTime.MinValue;
         private bool chartEventsAttached;
         private string cachedEntryLabelText;
         private string cachedStopLabelText;
@@ -902,25 +909,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             LogDebug("Blink: disarmed -> stop blinking");
             isDraggingStop = false;
             isDraggingTarget = false;
+            ResetLabelTrackingCaches();
             if (removeLines)
+            {
+                entryPrice = 0;
+                stopPrice = 0;
+                targetPrice = 0;
                 RemoveAllDrawObjects();
+            }
             UpdateUiState();
         }
 
         // Hard reset of arming and tracked prices; used on CLOSE flow to clear HUD artifacts.
         private void DisarmAndClearLines()
         {
-            isArmed = false;
-            armedDirection = ArmDirection.None;
-            hasPendingEntry = false;
-            blinkOn = false;
-            isDraggingStop = false;
-            isDraggingTarget = false;
-            entryPrice = 0;
-            stopPrice = 0;
-            targetPrice = 0;
-            RemoveAllDrawObjects();
-            UpdateUiState();
+            Disarm(true);
         }
 
         // Seeds entry/SL/TP lines from current bid/ask with default offsets; applies clamps to stay off-market before confirmation.
@@ -938,6 +941,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             entryLineDirty = true;
             stopLineDirty = true;
             targetLineDirty = true;
+            entryLabelDirty = true;
+            stopLabelDirty = true;
+            targetLabelDirty = true;
             ApplyLineUpdates();
             UpdateLabelsOnly();
 
@@ -957,6 +963,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 entryPrice = newEntry;
                 entryLineDirty = true;
+                entryLabelDirty = true;
             }
         }
 
@@ -1001,6 +1008,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 stopPrice = stop;
                 SetLinePrice(stopLine, stopPrice);
+                stopLabelDirty = true;
                 LogDebugDrag("DragMove SL ->", stopPrice);
                 if (IsOrderActive(stopOrder) && Position.MarketPosition != MarketPosition.Flat && EnsureSelfCheckPassed())
                 {
@@ -1016,6 +1024,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 targetPrice = target;
                 SetLinePrice(targetLine, targetPrice);
+                targetLabelDirty = true;
                 LogDebugDrag("DragMove TP ->", targetPrice);
                 if (targetOrder != null && targetOrder.OrderState == OrderState.Working && EnsureSelfCheckPassed())
                     SafeExecute("ChangeOrder-TargetDrag", () => ChangeOrder(targetOrder, targetOrder.Quantity, targetPrice, targetOrder.StopPrice));
@@ -1197,8 +1206,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            Disarm(true);
-            RemoveAllDrawObjects();
+            DisarmAndClearLines();
 
             entryOrder = null;
             stopOrder = null;
@@ -1492,23 +1500,43 @@ namespace NinjaTrader.NinjaScript.Strategies
             string entryLabel = GetEntryLabelSafe();
             string stopLbl = GetStopLabel();
             string targetLbl = GetTargetLabel();
+            double priceTolerance = Math.Max(TickSize() / 8, 0.0000001);
 
-            if (entryLabel != lastEntryLabel)
+            bool entryPriceMoved = HasLabelPriceMoved(entryPrice, lastEntryLabelPrice, priceTolerance);
+            bool stopPriceMoved = HasLabelPriceMoved(stopPrice, lastStopLabelPrice, priceTolerance);
+            bool targetPriceMoved = HasLabelPriceMoved(targetPrice, lastTargetLabelPrice, priceTolerance);
+
+            bool entryTextChanged = entryLabel != lastEntryLabel;
+            if (entryLabelDirty || entryTextChanged || entryPriceMoved)
             {
+                double oldEntryPrice = lastEntryLabelPrice;
                 CreateOrUpdateLabel(EntryLabelTag, entryPrice, entryLabel, Brushes.Black);
                 lastEntryLabel = entryLabel;
+                lastEntryLabelPrice = entryPrice;
+                entryLabelDirty = false;
+                LogLabelRefresh("ENTRY", entryTextChanged, entryPriceMoved, oldEntryPrice, entryPrice);
             }
 
-            if (stopLbl != lastStopLabel)
+            bool stopTextChanged = stopLbl != lastStopLabel;
+            if (stopLabelDirty || stopTextChanged || stopPriceMoved)
             {
+                double oldStopPrice = lastStopLabelPrice;
                 CreateOrUpdateLabel(StopLabelTag, stopPrice, stopLbl, Brushes.Red);
                 lastStopLabel = stopLbl;
+                lastStopLabelPrice = stopPrice;
+                stopLabelDirty = false;
+                LogLabelRefresh("SL", stopTextChanged, stopPriceMoved, oldStopPrice, stopPrice);
             }
 
-            if (targetLbl != lastTargetLabel)
+            bool targetTextChanged = targetLbl != lastTargetLabel;
+            if (targetLabelDirty || targetTextChanged || targetPriceMoved)
             {
+                double oldTargetPrice = lastTargetLabelPrice;
                 CreateOrUpdateLabel(TargetLabelTag, targetPrice, targetLbl, Brushes.ForestGreen);
                 lastTargetLabel = targetLbl;
+                lastTargetLabelPrice = targetPrice;
+                targetLabelDirty = false;
+                LogLabelRefresh("TP", targetTextChanged, targetPriceMoved, oldTargetPrice, targetPrice);
             }
 
             if (LogLevelSetting == LogLevelOption.Debug && ShouldLogDebug())
@@ -1520,6 +1548,39 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double targetTicks = tick > 0 ? Math.Abs(targetPrice - entryRef) / tick : 0;
                 LogDebug($"Sizing: qty {qty}, stopTicks {stopTicks:F1}, targetTicks {targetTicks:F1}, entryPrice={entryPrice:F2}, stopPrice={stopPrice:F2}, targetPrice={targetPrice:F2}, entryRef={entryRef:F2}");
             }
+        }
+
+        private bool HasLabelPriceMoved(double currentPrice, double previousPrice, double tolerance)
+        {
+            if (double.IsNaN(currentPrice) || currentPrice <= 0)
+                return false;
+            if (double.IsNaN(previousPrice))
+                return true;
+            return Math.Abs(currentPrice - previousPrice) >= tolerance;
+        }
+
+        private bool ShouldLogLabelRefresh()
+        {
+            if ((DateTime.Now - lastLabelRefreshLogTime).TotalMilliseconds < 200)
+                return false;
+            lastLabelRefreshLogTime = DateTime.Now;
+            return true;
+        }
+
+        private void LogLabelRefresh(string lineName, bool textChanged, bool priceMoved, double oldPrice, double newPrice)
+        {
+            if (LogLevelSetting != LogLevelOption.Debug)
+                return;
+            if (!textChanged && !priceMoved)
+                return;
+            if (!ShouldLogLabelRefresh())
+                return;
+
+            string reason = textChanged && priceMoved
+                ? "text changed + price moved"
+                : (textChanged ? "text changed" : "price moved");
+            string oldText = double.IsNaN(oldPrice) ? "n/a" : oldPrice.ToString("F2");
+            LogDebug($"Label redraw {lineName}: {reason}, oldPrice={oldText}, newPrice={newPrice:F2}");
         }
 
         // Entry label merges qty + RR, falling back to cached text when sizing temporarily unavailable.
@@ -1838,6 +1899,25 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // Clears label text/price caches so the next refresh always redraws at current anchors.
+        private void ResetLabelTrackingCaches()
+        {
+            lastEntryLabel = null;
+            lastStopLabel = null;
+            lastTargetLabel = null;
+            lastEntryLabelPrice = double.NaN;
+            lastStopLabelPrice = double.NaN;
+            lastTargetLabelPrice = double.NaN;
+            entryLabelDirty = true;
+            stopLabelDirty = true;
+            targetLabelDirty = true;
+            cachedEntryLabelText = null;
+            cachedStopLabelText = null;
+            cachedTargetLabelText = null;
+            cachedQtyLabelText = null;
+            cachedRrLabelText = null;
+        }
+
         // Remove all strategy-owned draw objects and reset caches; used on disarm and cleanup.
         private void RemoveAllDrawObjects()
         {
@@ -1871,14 +1951,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 entryLineDirty = false;
                 stopLineDirty = false;
                 targetLineDirty = false;
-                lastEntryLabel = null;
-                lastStopLabel = null;
-                lastTargetLabel = null;
-                cachedEntryLabelText = null;
-                cachedStopLabelText = null;
-                cachedTargetLabelText = null;
-                cachedQtyLabelText = null;
-                cachedRrLabelText = null;
+                ResetLabelTrackingCaches();
             }
             finally
             {
@@ -2063,7 +2136,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (chartEventsAttached || ChartControl == null)
                     return;
 
+                ChartControl.PreviewMouseLeftButtonUp += ChartControl_PreviewMouseLeftButtonUp;
                 ChartControl.MouseLeftButtonUp += ChartControl_MouseLeftButtonUp;
+                ChartControl.MouseLeave += ChartControl_MouseLeave;
                 chartEventsAttached = true;
                 SetMilestone("AttachChartEvents");
                 LogInfo("Chart events attached");
@@ -2084,11 +2159,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (!chartEventsAttached || ChartControl == null)
                     return;
 
+                ChartControl.PreviewMouseLeftButtonUp -= ChartControl_PreviewMouseLeftButtonUp;
                 ChartControl.MouseLeftButtonUp -= ChartControl_MouseLeftButtonUp;
+                ChartControl.MouseLeave -= ChartControl_MouseLeave;
                 chartEventsAttached = false;
                 SetMilestone("DetachChartEvents");
                 LogInfo("Chart events detached");
             });
+        }
+
+        private void ChartControl_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            TriggerCustomEvent(_ => SafeExecute("PreviewMouseUp", FinalizeDrag), null);
         }
 
         private void ChartControl_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
@@ -2096,19 +2178,27 @@ namespace NinjaTrader.NinjaScript.Strategies
             TriggerCustomEvent(_ => SafeExecute("MouseUp", FinalizeDrag), null);
         }
 
+        private void ChartControl_MouseLeave(object sender, MouseEventArgs e)
+        {
+            TriggerCustomEvent(_ => SafeExecute("MouseLeave", FinalizeDrag), null);
+        }
+
         // Finalizes drag (strategy thread): clamps prices, syncs ChangeOrder, and clears drag flags; ensures stops stay off-market.
         private void FinalizeDrag()
         {
+            if (!isDraggingStop && !isDraggingTarget)
+                return;
+
             SetMilestone("FinalizeDrag-Start");
             bool didLog = false;
             if (isDraggingStop)
             {
-                LogDebugDrag("DragEnd SL at", stopPrice);
+                LogDebug($"Drag end SL final={stopPrice:F2}");
                 didLog = true;
             }
             if (isDraggingTarget)
             {
-                LogDebugDrag("DragEnd TP at", targetPrice);
+                LogDebug($"Drag end TP final={targetPrice:F2}");
                 didLog = true;
             }
 
@@ -2124,6 +2214,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SetLinePrice(targetLine, targetPrice);
                 stopLineDirty = false;
                 targetLineDirty = false;
+                stopLabelDirty = true;
+                targetLabelDirty = true;
                 if (clamped)
                     LogClampOnce("Line clamped at drag end");
                 if (IsOrderActive(stopOrder) && Position.MarketPosition != MarketPosition.Flat && EnsureSelfCheckPassed())
@@ -2133,11 +2225,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 if (targetOrder != null && targetOrder.OrderState == OrderState.Working && EnsureSelfCheckPassed())
                     SafeExecute("ChangeOrder-TargetDragEnd", () => ChangeOrder(targetOrder, targetOrder.Quantity, targetPrice, targetOrder.StopPrice));
-                UpdateLabelsOnly();
             }
 
             isDraggingStop = false;
             isDraggingTarget = false;
+            if (didLog)
+                UpdateLabelsOnly();
             SetMilestone("FinalizeDrag-End");
         }
 
