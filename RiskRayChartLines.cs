@@ -143,7 +143,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         public void RemoveAllDrawObjects()
         {
-            string normalizedPrefix = normalizedPrefixProvider != null ? normalizedPrefixProvider() : string.Empty;
             WithSuppressedEvents(() =>
             {
                 HashSet<string> drawTags = new HashSet<string>();
@@ -162,9 +161,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     string tagStr = obj.Tag.ToString();
                     if (string.IsNullOrEmpty(tagStr))
                         continue;
-
-                    if (tagStr.StartsWith(normalizedPrefix, StringComparison.Ordinal))
-                        drawTags.Add(tagStr);
+                    drawTags.Add(tagStr);
                 }
 
                 foreach (string tag in drawTags)
@@ -221,7 +218,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             DrawingTool label = Draw.Text(owner, LabelTag(kind), text, barsAgo, offsetPrice, brush);
             if (label != null)
             {
-                label.IsLocked = false;
+                label.IsLocked = true;
                 label.IsAutoScale = false;
             }
             TrackDrawObject(label);

@@ -125,7 +125,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lastDragMoveLogStop = DateTime.MinValue;
         private DateTime lastDragMoveLogTarget = DateTime.MinValue;
         private DateTime lastMouseDragPulseUtc = DateTime.MinValue;
+        private DateTime lastUserInteractionUtc = DateTime.MinValue;
         private const int MouseDragPulseThrottleMs = 20;
+        private const int UserInteractionGraceMs = 200;
         private DateTime lastLabelRefreshLogTime = DateTime.MinValue;
         private bool chartEventsAttached;
         // Dialog/blink/self-check guards that throttle popups and enforce safety invariants.
@@ -304,6 +306,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 armedStopOffsetTicks = 0;
                 armedTargetOffsetTicks = 0;
                 dragFinalizePending = false;
+                lastUserInteractionUtc = DateTime.MinValue;
             }
             else if (State == State.Configure)
             {
@@ -928,6 +931,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             isDraggingStop = false;
             isDraggingTarget = false;
             dragFinalizePending = false;
+            lastUserInteractionUtc = DateTime.MinValue;
             userAdjustedStopWhileArmed = false;
             userAdjustedTargetWhileArmed = false;
             armedStopOffsetTicks = 0;
@@ -997,6 +1001,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             // Freeze entry auto-follow while user is interacting with lines to keep drag smooth.
             if (Mouse.LeftButton == MouseButtonState.Pressed || isDraggingStop || isDraggingTarget || dragFinalizePending)
+                return;
+            if (lastUserInteractionUtc != DateTime.MinValue
+                && (DateTime.UtcNow - lastUserInteractionUtc).TotalMilliseconds < UserInteractionGraceMs)
                 return;
 
             double tick = sizing.TickSize();
@@ -1069,6 +1076,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     stopPrice = snapped;
                     changed = true;
                     isDraggingStop = true;
+                    MarkUserInteraction();
                     if (isArmed && !hasPendingEntry)
                     {
                         userAdjustedStopWhileArmed = true;
@@ -1087,6 +1095,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     targetPrice = snapped;
                     changed = true;
                     isDraggingTarget = true;
+                    MarkUserInteraction();
                     if (isArmed && !hasPendingEntry)
                     {
                         userAdjustedTargetWhileArmed = true;
@@ -1098,6 +1107,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (!changed)
                 return false;
+            MarkUserInteraction();
 
             bool clamped = false;
             if (ShouldClampDraggedLines())
@@ -1134,6 +1144,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             double snapped = sizing.RoundToTick(candidate.Value);
             if (Math.Abs(snapped - trackedPrice) < sizing.TickSize() / 4)
                 return;
+            MarkUserInteraction();
 
             // User-driven drag detected
             if (isStop && !isDraggingStop)
@@ -1455,7 +1466,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool created = false;
             if (tags == null)
             {
-                tags = new RiskRayTagNames(normalizedPrefix);
+                tags = new RiskRayTagNames(normalizedPrefix, instanceId);
                 created = true;
             }
             if (sizing == null)
@@ -1551,6 +1562,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void ApplyLineUpdates()
         {
             EnsureHelpers();
+            if (lastUserInteractionUtc != DateTime.MinValue
+                && (DateTime.UtcNow - lastUserInteractionUtc).TotalMilliseconds < UserInteractionGraceMs)
+                return;
             // Only move lines when their tracked price changed; avoids ticking redraws that used to override user drags.
             if (entryLineDirty)
             {
@@ -1955,6 +1969,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             lastMilestoneTime = DateTime.Now;
         }
 
+        private void MarkUserInteraction()
+        {
+            lastUserInteractionUtc = DateTime.UtcNow;
+        }
+
         private void LogUiError(string context, Exception ex)
         {
             if ((DateTime.Now - lastUiErrorLogTime).TotalSeconds < 1)
@@ -2042,18 +2061,21 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ChartControl_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
         {
+            MarkUserInteraction();
             dragFinalizePending = true;
             TriggerCustomEvent(_ => SafeExecute("PreviewMouseUp", FinalizeDrag), null);
         }
 
         private void ChartControl_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
         {
+            MarkUserInteraction();
             dragFinalizePending = true;
             TriggerCustomEvent(_ => SafeExecute("MouseUp", FinalizeDrag), null);
         }
 
         private void ChartControl_MouseLeave(object sender, MouseEventArgs e)
         {
+            MarkUserInteraction();
             dragFinalizePending = true;
             TriggerCustomEvent(_ => SafeExecute("MouseLeave", FinalizeDrag), null);
         }
@@ -2071,6 +2093,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
 
             lastMouseDragPulseUtc = DateTime.UtcNow;
+            MarkUserInteraction();
             TriggerCustomEvent(_ => SafeExecute("MouseMoveDragPulse", HandleMouseDragPulse), null);
         }
 
@@ -2105,6 +2128,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         LogDebug($"FinalizeDrag duplicate suppressed ({elapsedMs:F0}ms)");
                     return;
                 }
+                MarkUserInteraction();
 
                 SetMilestone("FinalizeDrag-Start");
                 bool didLog = false;
@@ -2443,13 +2467,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        #if true
         // Fallback helper types kept inside RiskRay so NT8 can compile this strategy
         // even when external helper files are not in the active compile scope.
         private sealed class RiskRayTagNames
         {
             private readonly string prefix;
 
-            public RiskRayTagNames(string orderTagPrefix)
+            public RiskRayTagNames(string orderTagPrefix, string drawInstanceScope = null)
             {
                 string normalized = string.IsNullOrWhiteSpace(orderTagPrefix) ? "RR_" : orderTagPrefix.Trim();
                 prefix = string.IsNullOrWhiteSpace(normalized) ? "RR_" : normalized;
@@ -3115,6 +3140,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        #endif
         #endregion
     }
 }
