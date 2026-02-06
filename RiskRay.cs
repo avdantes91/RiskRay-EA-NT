@@ -155,6 +155,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lastUiUnavailableLogTime = DateTime.MinValue;
         private readonly string instanceId = Guid.NewGuid().ToString("N").Substring(0, 6);
         private int stateChangeSeq = 0;
+        private bool terminatedCleanupDone;
         private bool isRunningInstance;
         private bool userAdjustedStopWhileArmed;
         private bool userAdjustedTargetWhileArmed;
@@ -305,6 +306,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastMilestone = null;
                 lastMilestoneTime = DateTime.MinValue;
                 fatalCount = 0;
+                terminatedCleanupDone = false;
                 userAdjustedStopWhileArmed = false;
                 userAdjustedTargetWhileArmed = false;
                 armedStopOffsetTicks = 0;
@@ -343,30 +345,37 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print($"{Prefix("TRACE")} State.Terminated begin");
                 bool chartNull = ChartControl == null;
                 bool dispOk = ChartControl?.Dispatcher != null && !(ChartControl?.Dispatcher.HasShutdownStarted ?? true);
-                Print($"{Prefix("TRACE")} Terminated: dispatcherOk={dispOk} chartNull={chartNull}");
+                string reason = ClassifyTerminationReason(chartNull, dispOk);
                 SetMilestone("Terminated-Start");
                 try
                 {
-                    if (chartNull)
+                    string cleanupMode;
+                    if (terminatedCleanupDone)
                     {
-                        Print($"{Prefix("TRACE")} Terminated helper instance (chartNull=True) -> skipping UI cleanup");
-                        RemoveAllDrawObjects();
+                        cleanupMode = "AlreadyCompleted";
                     }
-                    else if (!dispOk)
+                    else if (chartNull || !dispOk)
                     {
-                        DetachChartEvents();
+                        // UI thread is unavailable; release local refs only.
                         StopBlinkTimer();
-                        DisposeUi(true);
+                        ReleaseUiReferencesNoDispatcher();
                         RemoveAllDrawObjects();
+                        terminatedCleanupDone = true;
+                        cleanupMode = "UISkipped";
                     }
                     else
                     {
-                        DetachChartEvents();
                         StopBlinkTimer();
                         DisposeUi(true);
                         RemoveAllDrawObjects();
+                        terminatedCleanupDone = true;
+                        cleanupMode = "UIExecuted";
                     }
-                    Print($"{Prefix()} [State.Terminated] state={DescribeState()} fatal={fatalError} detail={fatalErrorMessage} milestone={lastMilestone} at={lastMilestoneTime:o} fatalCount={fatalCount}");
+                    string level = fatalError ? "WARN" : "INFO";
+                    Print($"{Prefix(level)} Terminated reason={reason} cleanup={cleanupMode} chartNull={chartNull} dispatcherOk={dispOk} fatal={fatalError}");
+                    if (fatalError && !string.IsNullOrEmpty(fatalErrorMessage))
+                        Print($"{Prefix("WARN")} Terminated detail={fatalErrorMessage}");
+                    Print($"{Prefix("TRACE")} [State.Terminated] state={DescribeState()} milestone={lastMilestone} at={lastMilestoneTime:o} fatalCount={fatalCount}");
                 }
                 catch (Exception ex)
                 {
@@ -386,6 +395,30 @@ namespace NinjaTrader.NinjaScript.Strategies
                 isRunningInstance = true;
                 Print($"{Prefix("TRACE")} RUNNING_INSTANCE chartAttached=True instrument={Instrument?.FullName}");
             }
+        }
+
+        private string ClassifyTerminationReason(bool chartNull, bool dispatcherOk)
+        {
+            if (fatalError)
+                return "FatalError";
+            if (chartNull)
+                return "ChartDetachedOrClosed";
+            if (!dispatcherOk)
+                return "UIUnavailable";
+            return "StrategyDisabledOrReloaded";
+        }
+
+        private void ReleaseUiReferencesNoDispatcher()
+        {
+            chartEventsAttached = false;
+            buyButton = null;
+            sellButton = null;
+            closeButton = null;
+            beButton = null;
+            trailButton = null;
+            uiRoot = null;
+            chartGrid = null;
+            uiLoaded = false;
         }
 
         // Main tick handler in realtime: keeps entry line following bid/ask while armed and refreshes HUD without changing user-placed stops/targets.
@@ -1263,6 +1296,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 LogClampOnce("Lines clamped before entry to avoid immediate triggers");
             }
 
+            if (!HasValidEntryRiskStop())
+            {
+                LogInfo("Entry blocked: invalid stop placement (stop must stay on loss side of entry)");
+                return;
+            }
+
             int qty = sizing.CalculateQuantity(entryPrice, stopPrice, FixedRiskUSD, CommissionMode == CommissionModeOption.On, CommissionPerContractRoundTurn, MaxContracts);
             if (qty < 1)
             {
@@ -1546,6 +1585,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             return bid > 0 ? bid : last;
         }
 
+        private bool HasValidEntryRiskStop()
+        {
+            double tick = sizing.TickSize();
+            if (tick <= 0)
+                return false;
+
+            if (armedDirection == ArmDirection.Long)
+                return (entryPrice - stopPrice) > tick / 4;
+            if (armedDirection == ArmDirection.Short)
+                return (stopPrice - entryPrice) > tick / 4;
+            return false;
+        }
+
         #region Risk & Sizing
 
         // Entry reference for risk sizing prefers live average price, otherwise current ARMED entry tracking.
@@ -1558,6 +1610,28 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return GetEntryReference(armedDirection);
 
             return entryPrice;
+        }
+
+        private bool TryGetDirectionalStopTicks(double entryRef, double stopRef, out double stopTicks)
+        {
+            stopTicks = 0;
+            double tick = sizing.TickSize();
+            if (tick <= 0)
+                return false;
+
+            MarketPosition direction = GetWorkingDirection();
+            if (direction == MarketPosition.Long)
+            {
+                stopTicks = (entryRef - stopRef) / tick;
+                return true;
+            }
+            if (direction == MarketPosition.Short)
+            {
+                stopTicks = (stopRef - entryRef) / tick;
+                return true;
+            }
+
+            return false;
         }
 
         #region HUD
@@ -1722,12 +1796,25 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (LogLevelSetting == LogLevelOption.Debug && ShouldLogDebug())
             {
-                int qty = sizing.CalculateQuantity(entryPrice, stopPrice, FixedRiskUSD, CommissionMode == CommissionModeOption.On, CommissionPerContractRoundTurn, MaxContracts);
                 double tick = sizing.TickSize();
                 double entryRef = GetEntryReferenceForRisk();
-                double stopTicks = tick > 0 ? Math.Abs(entryRef - stopPrice) / tick : 0;
                 double targetTicks = tick > 0 ? Math.Abs(targetPrice - entryRef) / tick : 0;
-                LogDebug($"Sizing: qty {qty}, stopTicks {stopTicks:F1}, targetTicks {targetTicks:F1}, entryPrice={entryPrice:F2}, stopPrice={stopPrice:F2}, targetPrice={targetPrice:F2}, entryRef={entryRef:F2}");
+                double stopTicks;
+                bool directional = TryGetDirectionalStopTicks(entryRef, stopPrice, out stopTicks);
+                if (directional && stopTicks <= 0)
+                {
+                    string qtyDisplay = Position.MarketPosition != MarketPosition.Flat && Position.Quantity != 0
+                        ? $"{Math.Abs(Position.Quantity)} contracts"
+                        : "N/A";
+                    LogDebug($"Sizing: risk-free stop (stopTicks<=0) -> risk=0, qtyDisplay={qtyDisplay}, targetTicks={targetTicks:F1}, entryPrice={entryPrice:F2}, stopPrice={stopPrice:F2}, targetPrice={targetPrice:F2}, entryRef={entryRef:F2}");
+                }
+                else
+                {
+                    if (!directional)
+                        stopTicks = tick > 0 ? Math.Abs(entryRef - stopPrice) / tick : 0;
+                    int qty = sizing.CalculateQuantity(entryPrice, stopPrice, FixedRiskUSD, CommissionMode == CommissionModeOption.On, CommissionPerContractRoundTurn, MaxContracts);
+                    LogDebug($"Sizing: qty {qty}, stopTicks {stopTicks:F1}, targetTicks {targetTicks:F1}, entryPrice={entryPrice:F2}, stopPrice={stopPrice:F2}, targetPrice={targetPrice:F2}, entryRef={entryRef:F2}");
+                }
             }
         }
 
@@ -3011,12 +3098,22 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 double tick;
                 double tickValue;
-                double entryRefUnused;
+                double entryRef;
                 string reasonUnused;
-                if (!TryComputeSizing(s, out tick, out tickValue, out entryRefUnused, out reasonUnused))
+                if (!TryComputeSizing(s, out tick, out tickValue, out entryRef, out reasonUnused))
                     return UseCachedOrPlaceholder(ref cachedQtyLabelText);
 
-                double stopTicks = Math.Abs(s.EntryPrice - s.StopPrice) / tick;
+                double stopTicks = Math.Abs(entryRef - s.StopPrice) / tick;
+                double directionalStopTicks;
+                if (TryGetDirectionalRiskTicks(s, entryRef, tick, out directionalStopTicks))
+                {
+                    if (directionalStopTicks <= double.Epsilon)
+                    {
+                        cachedQtyLabelText = RiskFreeQtyLabel();
+                        return cachedQtyLabelText;
+                    }
+                    stopTicks = directionalStopTicks;
+                }
                 double perContractRisk = (stopTicks * tickValue) + (s.CommissionOn ? s.CommissionPerContractRoundTurn : 0);
                 double rawQty = perContractRisk > 0 ? s.FixedRiskUSD / perContractRisk : 0;
                 int roundedQty = (int)Math.Floor(rawQty + 0.5);
@@ -3040,6 +3137,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return UseCachedOrPlaceholder(ref cachedStopLabelText);
 
                 double stopDistanceTicks = Math.Abs(entryRef - s.StopPrice) / tick;
+                double directionalStopTicks;
+                if (TryGetDirectionalRiskTicks(s, entryRef, tick, out directionalStopTicks))
+                {
+                    if (directionalStopTicks <= double.Epsilon)
+                    {
+                        cachedStopLabelText = $"SL: {currencySymbolProvider()}0.00 (risk-free)";
+                        return cachedStopLabelText;
+                    }
+                    stopDistanceTicks = directionalStopTicks;
+                }
                 if (double.IsNaN(stopDistanceTicks) || double.IsInfinity(stopDistanceTicks))
                     return UseCachedOrPlaceholder(ref cachedStopLabelText);
 
@@ -3101,6 +3208,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return UseCachedOrPlaceholder(ref cachedRrLabelText);
 
                 double stopTicks = Math.Abs(entryRef - s.StopPrice) / tick;
+                double directionalStopTicks;
+                if (TryGetDirectionalRiskTicks(s, entryRef, tick, out directionalStopTicks))
+                {
+                    if (directionalStopTicks <= double.Epsilon)
+                    {
+                        cachedRrLabelText = "Rinf";
+                        return cachedRrLabelText;
+                    }
+                    stopTicks = directionalStopTicks;
+                }
                 double rewardTicks = Math.Abs(s.TargetPrice - entryRef) / tick;
                 if (stopTicks <= double.Epsilon || double.IsNaN(stopTicks) || double.IsInfinity(stopTicks))
                     return UseCachedOrPlaceholder(ref cachedRrLabelText);
@@ -3143,6 +3260,45 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 reason = null;
                 return true;
+            }
+
+            private bool TryGetDirectionalRiskTicks(Snapshot s, double entryRef, double tick, out double stopRiskTicks)
+            {
+                stopRiskTicks = 0;
+                MarketPosition direction = InferDirection(s, entryRef, tick);
+                if (direction == MarketPosition.Long)
+                {
+                    stopRiskTicks = (entryRef - s.StopPrice) / tick;
+                    return true;
+                }
+                if (direction == MarketPosition.Short)
+                {
+                    stopRiskTicks = (s.StopPrice - entryRef) / tick;
+                    return true;
+                }
+
+                return false;
+            }
+
+            private string RiskFreeQtyLabel()
+            {
+                return "N/A";
+            }
+
+            private MarketPosition InferDirection(Snapshot s, double entryRef, double tick)
+            {
+                if (tick <= 0)
+                    return MarketPosition.Flat;
+
+                if (s.TargetPrice > entryRef + tick / 4)
+                    return MarketPosition.Long;
+                if (s.TargetPrice < entryRef - tick / 4)
+                    return MarketPosition.Short;
+                if (s.StopPrice < entryRef - tick / 4)
+                    return MarketPosition.Long;
+                if (s.StopPrice > entryRef + tick / 4)
+                    return MarketPosition.Short;
+                return MarketPosition.Flat;
             }
 
             private string UseCachedOrPlaceholder(ref string cache)
