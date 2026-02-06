@@ -157,6 +157,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int stateChangeSeq = 0;
         private bool terminatedCleanupDone;
         private bool terminationSummaryLogged;
+        private bool bracketIncompleteHandled;
         private DateTime lastSizingDebugLogTime = DateTime.MinValue;
         private int lastSizingDebugQty = int.MinValue;
         private double lastSizingDebugStopTicks = double.NaN;
@@ -275,7 +276,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         protected override void OnStateChange()
         {
             stateChangeSeq++;
-            Print($"{Prefix("TRACE")} OnStateChange seq={stateChangeSeq} state={State}");
+            if (LogLevelSetting == LogLevelOption.Debug && State != State.Terminated)
+                Print($"{Prefix("TRACE")} OnStateChange seq={stateChangeSeq} state={State}");
             if (State == State.SetDefaults)
             {
                 Name = "RiskRay";
@@ -321,6 +323,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 fatalCount = 0;
                 terminatedCleanupDone = false;
                 terminationSummaryLogged = false;
+                bracketIncompleteHandled = false;
                 forceSizingDebugLog = false;
                 lastSizingDebugLogTime = DateTime.MinValue;
                 lastSizingDebugQty = int.MinValue;
@@ -343,64 +346,73 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Historical)
             {
-                Print($"{Prefix("TRACE")} State.Historical begin");
+                if (LogLevelSetting == LogLevelOption.Debug)
+                    Print($"{Prefix("TRACE")} State.Historical begin");
                 TryMarkRunningInstance();
                 SetMilestone("Historical");
                 SafeExecute("BuildUi", BuildUi);
                 SafeExecute("AttachChartEvents", AttachChartEvents);
-                Print($"{Prefix("TRACE")} State.Historical end");
+                if (LogLevelSetting == LogLevelOption.Debug)
+                    Print($"{Prefix("TRACE")} State.Historical end");
             }
             else if (State == State.Realtime)
             {
-                Print($"{Prefix("TRACE")} State.Realtime begin");
+                if (LogLevelSetting == LogLevelOption.Debug)
+                    Print($"{Prefix("TRACE")} State.Realtime begin");
                 TryMarkRunningInstance();
                 SetMilestone("Realtime");
                 RunSelfCheckOnce();
                 SafeExecute("StartBlinkTimer", StartBlinkTimer);
                 SafeExecute("AttachChartEvents", AttachChartEvents);
-                Print($"{Prefix("TRACE")} State.Realtime end");
+                if (LogLevelSetting == LogLevelOption.Debug)
+                    Print($"{Prefix("TRACE")} State.Realtime end");
             }
             else if (State == State.Terminated)
             {
                 bool chartNull = ChartControl == null;
-                bool dispOk = CanTouchUi();
-                string reason = ClassifyTerminationReason(chartNull, dispOk);
+                bool dispatcherOk = CanTouchUi();
+                bool shouldSkipUi = chartNull || !dispatcherOk;
+                string reason = ClassifyTerminationReason(chartNull, dispatcherOk);
+                string cleanupMode = "AlreadyCompleted";
+                bool cleanupAttempted = false;
+                bool cleanupFailed = false;
                 SetMilestone("Terminated-Start");
                 try
                 {
-                    string cleanupMode;
-                    if (terminatedCleanupDone)
+                    if (!terminatedCleanupDone)
                     {
-                        cleanupMode = "AlreadyCompleted";
-                    }
-                    else if (chartNull || !dispOk)
-                    {
-                        // UI thread is unavailable; release local refs only.
+                        cleanupAttempted = true;
                         StopBlinkTimer();
-                        CleanupStateWithoutUi();
+                        if (shouldSkipUi)
+                        {
+                            // No dispatcher available: clear local state only.
+                            CleanupStateWithoutUi();
+                        }
+                        else
+                        {
+                            DisposeUi(true);
+                            RemoveAllDrawObjects();
+                        }
                         terminatedCleanupDone = true;
-                        cleanupMode = "UISkipped";
-                    }
-                    else
-                    {
-                        StopBlinkTimer();
-                        DisposeUi(true);
-                        RemoveAllDrawObjects();
-                        terminatedCleanupDone = true;
-                        cleanupMode = "UIExecuted";
-                    }
-                    if (!terminationSummaryLogged)
-                    {
-                        string level = fatalError ? "WARN" : "INFO";
-                        Print($"{Prefix(level)} Terminated reason={reason} cleanup={cleanupMode} chartNull={chartNull} dispatcherOk={dispOk} fatal={fatalError}");
-                        if (fatalError && !string.IsNullOrEmpty(fatalErrorMessage))
-                            Print($"{Prefix("WARN")} Terminated detail={fatalErrorMessage}");
-                        terminationSummaryLogged = true;
                     }
                 }
                 catch (Exception ex)
                 {
+                    cleanupFailed = true;
                     LogFatal("OnStateChange.Terminated", ex);
+                }
+                finally
+                {
+                    if (cleanupAttempted)
+                        cleanupMode = cleanupFailed ? "CleanupFailed" : (shouldSkipUi ? "UISkipped" : "UIExecuted");
+                    if (!terminationSummaryLogged)
+                    {
+                        string level = fatalError ? "WARN" : "INFO";
+                        Print($"{Prefix(level)} Terminated reason={reason} cleanup={cleanupMode} chartNull={chartNull} dispatcherOk={dispatcherOk} fatal={fatalError}");
+                        if (fatalError && !string.IsNullOrEmpty(fatalErrorMessage))
+                            Print($"{Prefix("WARN")} Terminated detail={fatalErrorMessage}");
+                        terminationSummaryLogged = true;
+                    }
                 }
             }
         }
@@ -413,7 +425,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (ChartControl != null && dispatcher != null && !dispatcher.HasShutdownStarted)
             {
                 isRunningInstance = true;
-                Print($"{Prefix("TRACE")} RUNNING_INSTANCE chartAttached=True instrument={Instrument?.FullName}");
+                if (LogLevelSetting == LogLevelOption.Debug)
+                    Print($"{Prefix("TRACE")} RUNNING_INSTANCE chartAttached=True instrument={Instrument?.FullName}");
             }
         }
 
@@ -551,6 +564,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     LogInfo($"Order rejected ({order.Name}): {nativeError ?? error.ToString()}");
                     CleanupAfterError();
                 }
+
             }
             catch (Exception ex)
             {
@@ -567,11 +581,83 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (execution == null || execution.Order == null)
                     return;
 
-                if (execution.Order.Name == tags.EntrySignalLong || execution.Order.Name == tags.EntrySignalShort)
+                bool isEntryExec = execution.Order.Name == tags.EntrySignalLong || execution.Order.Name == tags.EntrySignalShort;
+                if (isEntryExec)
+                {
                     avgEntryPrice = execution.Order.AverageFillPrice;
+                    if (!EnsureSelfCheckPassed())
+                        return;
 
-                if (execution.Order.Name == tags.StopSignal || execution.Order.Name == tags.TargetSignal)
+                    int openQty = Math.Abs(Position.Quantity);
+                    if (openQty <= 0)
+                        openQty = Math.Abs(execution.Quantity);
+                    if (openQty <= 0)
+                        return;
+
+                    double stop = sizing.RoundToTick(stopPrice);
+                    double target = sizing.RoundToTick(targetPrice);
+                    if (double.IsNaN(stop) || double.IsInfinity(stop) || stop <= 0
+                        || double.IsNaN(target) || double.IsInfinity(target) || target <= 0)
+                    {
+                        Print($"{Prefix("WARN")} BracketPriceInvalid: stop={stop:F2} target={target:F2} -> flatten");
+                        FailSafeFlatten("BracketPriceInvalid");
+                        return;
+                    }
+                    OrderAction stopAction = execution.Order.OrderAction == OrderAction.Buy ? OrderAction.Sell : OrderAction.BuyToCover;
+                    OrderAction targetAction = stopAction;
+                    if (stopOrder == null && targetOrder == null)
+                    {
+                        SafeExecute("SubmitExitBracket", () =>
+                        {
+                            currentOco = Guid.NewGuid().ToString("N");
+                            stopOrder = SubmitOrderUnmanaged(0, stopAction, OrderType.StopMarket, openQty, 0, stop, currentOco, tags.StopSignal);
+                            targetOrder = SubmitOrderUnmanaged(0, targetAction, OrderType.Limit, openQty, target, 0, currentOco, tags.TargetSignal);
+                        });
+                        LogInfo($"Bracket submitted on entry exec: qty {openQty}, SL {stop:F2}, TP {target:F2}");
+                    }
+                    else
+                    {
+                        bool resized = false;
+                        if (stopOrder != null && IsOrderActive(stopOrder) && stopOrder.Quantity != openQty)
+                        {
+                            if (IsOrderSafeForResize(stopOrder))
+                            {
+                                SafeExecute("ResizeStopOnFill", () => ChangeOrder(stopOrder, openQty, stopOrder.LimitPrice, stop));
+                                resized = true;
+                            }
+                            else
+                            {
+                                LogDebug($"ResizeStop skipped: state={stopOrder.OrderState}");
+                            }
+                        }
+                        if (targetOrder != null && IsOrderActive(targetOrder) && targetOrder.Quantity != openQty)
+                        {
+                            if (IsOrderSafeForResize(targetOrder))
+                            {
+                                SafeExecute("ResizeTargetOnFill", () => ChangeOrder(targetOrder, openQty, target, targetOrder.StopPrice));
+                                resized = true;
+                            }
+                            else
+                            {
+                                LogDebug($"ResizeTarget skipped: state={targetOrder.OrderState}");
+                            }
+                        }
+                        if (resized)
+                            LogDebug($"Bracket qty synced to {openQty} on entry exec");
+                    }
+                }
+
+                bool isExitExec = execution.Order.Name == tags.StopSignal || execution.Order.Name == tags.TargetSignal;
+                if (isExitExec)
                     ProcessExitFill(execution.Order, execution, "OnExecutionUpdate");
+
+                if (!isExitExec)
+                {
+                    bool stopActive = IsOrderActive(stopOrder);
+                    bool targetActive = IsOrderActive(targetOrder);
+                    if (Position.MarketPosition != MarketPosition.Flat && (stopActive ^ targetActive))
+                        FailSafeFlatten("BracketIncomplete");
+                }
             }
             catch (Exception ex)
             {
@@ -590,6 +676,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (marketPosition == MarketPosition.Flat)
                 {
+                    bracketIncompleteHandled = false;
                     avgEntryPrice = 0;
                     entryOrder = null;
                     stopOrder = null;
@@ -889,81 +976,96 @@ namespace NinjaTrader.NinjaScript.Strategies
         // BUY uses ARMED -> CONFIRM: first click arms, second submits entry + bracket if flat and no pending entry.
         private void OnBuyClicked(object sender, RoutedEventArgs e)
         {
-            LogInfo("UserClick: BUYARM");
-            forceSizingDebugLog = true;
-            SafeExecute("OnBuyClicked", () =>
+            TriggerCustomEvent(_ =>
             {
-                if (Position.MarketPosition != MarketPosition.Flat || entryOrder != null)
+                LogInfo("UserClick: BUYARM");
+                forceSizingDebugLog = true;
+                SafeExecute("OnBuyClicked", () =>
                 {
-                    LogInfo("Arming blocked while position active");
-                    return;
-                }
+                    if (Position.MarketPosition != MarketPosition.Flat || entryOrder != null)
+                    {
+                        LogInfo("Arming blocked while position active");
+                        return;
+                    }
 
-                if (isArmed && armedDirection == ArmDirection.Long)
-                {
-                    ConfirmEntry();
-                }
-                else
-                {
-                    Arm(ArmDirection.Long);
-                }
-            });
+                    if (isArmed && armedDirection == ArmDirection.Long)
+                    {
+                        ConfirmEntry();
+                    }
+                    else
+                    {
+                        Arm(ArmDirection.Long);
+                    }
+                });
+            }, null);
         }
 
         // SELL mirrors BUY flow for shorts and blocks arming while any position or pending entry exists.
         private void OnSellClicked(object sender, RoutedEventArgs e)
         {
-            LogInfo("UserClick: SELLARM");
-            forceSizingDebugLog = true;
-            SafeExecute("OnSellClicked", () =>
+            TriggerCustomEvent(_ =>
             {
-                if (Position.MarketPosition != MarketPosition.Flat || entryOrder != null)
+                LogInfo("UserClick: SELLARM");
+                forceSizingDebugLog = true;
+                SafeExecute("OnSellClicked", () =>
                 {
-                    LogInfo("Arming blocked while position active");
-                    return;
-                }
+                    if (Position.MarketPosition != MarketPosition.Flat || entryOrder != null)
+                    {
+                        LogInfo("Arming blocked while position active");
+                        return;
+                    }
 
-                if (isArmed && armedDirection == ArmDirection.Short)
-                {
-                    ConfirmEntry();
-                }
-                else
-                {
-                    Arm(ArmDirection.Short);
-                }
-            });
+                    if (isArmed && armedDirection == ArmDirection.Short)
+                    {
+                        ConfirmEntry();
+                    }
+                    else
+                    {
+                        Arm(ArmDirection.Short);
+                    }
+                });
+            }, null);
         }
 
         // CLOSE cancels all working orders and flattens exposure regardless of ARMED state.
         private void OnCloseClicked(object sender, RoutedEventArgs e)
         {
-            try
+            TriggerCustomEvent(_ =>
             {
-                LogInfo("UserClick: CLOSE");
-                forceSizingDebugLog = true;
-                Print($"{Prefix()} CLOSE click received");
-                ResetAndFlatten("UserClose");
-            }
-            catch (Exception ex)
-            {
-                Print($"{Prefix()} CLOSE exception: " + ex);
-            }
+                try
+                {
+                    LogInfo("UserClick: CLOSE");
+                    forceSizingDebugLog = true;
+                    Print($"{Prefix()} CLOSE click received");
+                    ResetAndFlatten("UserClose");
+                }
+                catch (Exception ex)
+                {
+                    Print($"{Prefix()} CLOSE exception: " + ex);
+                }
+            }, null);
         }
 
         // BE shifts stop to break-even (+offset) only when trade is in profit; otherwise shows throttled dialog.
         private void OnBeClicked(object sender, RoutedEventArgs e)
         {
-            LogInfo("UserClick: BE");
-            forceSizingDebugLog = true;
-            SafeExecute("OnBeClicked", MoveStopToBreakEven);
+            TriggerCustomEvent(_ =>
+            {
+                LogInfo("UserClick: BE");
+                forceSizingDebugLog = true;
+                SafeExecute("OnBeClicked", MoveStopToBreakEven);
+            }, null);
         }
 
         // TRAIL repositions the stop relative to current market using configured offset when a working stop exists.
         private void OnTrailClicked(object sender, RoutedEventArgs e)
         {
-            LogInfo("UserClick: TRAIL");
-            forceSizingDebugLog = true;
-            SafeExecute("OnTrailClicked", ExecuteTrailStop);
+            TriggerCustomEvent(_ =>
+            {
+                LogInfo("UserClick: TRAIL");
+                forceSizingDebugLog = true;
+                SafeExecute("OnTrailClicked", ExecuteTrailStop);
+            }, null);
         }
 
         #endregion
@@ -1352,16 +1454,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             OrderAction entryAction = armedDirection == ArmDirection.Long ? OrderAction.Buy : OrderAction.SellShort;
-            OrderAction stopAction = armedDirection == ArmDirection.Long ? OrderAction.Sell : OrderAction.BuyToCover;
-            OrderAction targetAction = stopAction;
             string entryName = armedDirection == ArmDirection.Long ? tags.EntrySignalLong : tags.EntrySignalShort;
 
             SafeExecute("SubmitOrders", () =>
             {
                 entryOrder = SubmitOrderUnmanaged(0, entryAction, OrderType.Market, qty, 0, 0, null, entryName);
-                currentOco = Guid.NewGuid().ToString("N");
-                stopOrder = SubmitOrderUnmanaged(0, stopAction, OrderType.StopMarket, qty, 0, stopPrice, currentOco, tags.StopSignal);
-                targetOrder = SubmitOrderUnmanaged(0, targetAction, OrderType.Limit, qty, targetPrice, 0, currentOco, tags.TargetSignal);
+                stopOrder = null;
+                targetOrder = null;
+                currentOco = null;
             });
 
             isArmed = false;
@@ -1380,6 +1480,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             EnsureHelpers();
             SetMilestone("ResetAndFlatten-Start");
             LogInfo("CLOSE pressed -> cancel orders + flatten + UI reset");
+            forceSizingDebugLog = false;
 
             CancelActiveOrder(entryOrder, "CancelEntry");
             CancelActiveOrder(stopOrder, "CancelStop");
@@ -1530,6 +1631,48 @@ namespace NinjaTrader.NinjaScript.Strategies
                 CancelOrder(stopOrder);
             if (IsOrderActive(targetOrder))
                 CancelOrder(targetOrder);
+            if (Position.MarketPosition != MarketPosition.Flat)
+            {
+                int qty = Math.Abs(Position.Quantity);
+                if (qty > 0)
+                {
+                    OrderAction action = Position.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.BuyToCover;
+                    SafeExecute("CloseAfterReject", () => SubmitOrderUnmanaged(0, action, OrderType.Market, qty, 0, 0, null, tags.CloseSignal));
+                }
+            }
+            Disarm();
+            RemoveAllDrawObjects();
+        }
+
+        private bool IsOrderSafeForResize(Order order)
+        {
+            if (order == null)
+                return false;
+            return order.OrderState == OrderState.Working
+                || order.OrderState == OrderState.Accepted
+                || order.OrderState == OrderState.PartFilled;
+        }
+
+        private void FailSafeFlatten(string reason)
+        {
+            if (bracketIncompleteHandled)
+                return;
+            if (Position.MarketPosition == MarketPosition.Flat)
+                return;
+            bracketIncompleteHandled = true;
+            Print($"{Prefix("WARN")} BracketIncomplete: {reason} -> flatten");
+
+            CancelActiveOrder(entryOrder, "BracketFailSafeCancelEntry");
+            CancelActiveOrder(stopOrder, "BracketFailSafeCancelStop");
+            CancelActiveOrder(targetOrder, "BracketFailSafeCancelTarget");
+
+            int qty = Math.Abs(Position.Quantity);
+            if (qty > 0)
+            {
+                OrderAction action = Position.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.BuyToCover;
+                SafeExecute("BracketFailSafeClose", () => SubmitOrderUnmanaged(0, action, OrderType.Market, qty, 0, 0, null, tags.CloseSignal));
+            }
+
             Disarm();
             RemoveAllDrawObjects();
         }
@@ -1836,26 +1979,36 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            if (LogLevelSetting == LogLevelOption.Debug && ShouldLogDebug())
+            if (LogLevelSetting != LogLevelOption.Debug && forceSizingDebugLog)
+                forceSizingDebugLog = false;
+
+            if (LogLevelSetting == LogLevelOption.Debug)
             {
+                bool forceLog = forceSizingDebugLog;
                 double tick = sizing.TickSize();
                 double entryRef = GetEntryReferenceForRisk();
                 double targetTicks = tick > 0 ? Math.Abs(targetPrice - entryRef) / tick : 0;
                 double stopTicks;
                 bool directional = TryGetDirectionalStopTicks(entryRef, stopPrice, out stopTicks);
-                if (directional && stopTicks <= 0)
+                if (!directional)
+                    stopTicks = tick > 0 ? Math.Abs(entryRef - stopPrice) / tick : 0;
+                int qty = sizing.CalculateQuantity(entryPrice, stopPrice, FixedRiskUSD, CommissionMode == CommissionModeOption.On, CommissionPerContractRoundTurn, MaxContracts);
+
+                if (ShouldLogSizingDebug(qty, stopTicks, targetTicks, entryRef, forceLog))
                 {
-                    string qtyDisplay = Position.MarketPosition != MarketPosition.Flat && Position.Quantity != 0
-                        ? $"{Math.Abs(Position.Quantity)} contracts"
-                        : "N/A";
-                    LogDebug($"Sizing: risk-free stop (stopTicks<=0) -> risk=0, qtyDisplay={qtyDisplay}, targetTicks={targetTicks:F1}, entryPrice={entryPrice:F2}, stopPrice={stopPrice:F2}, targetPrice={targetPrice:F2}, entryRef={entryRef:F2}");
-                }
-                else
-                {
-                    if (!directional)
-                        stopTicks = tick > 0 ? Math.Abs(entryRef - stopPrice) / tick : 0;
-                    int qty = sizing.CalculateQuantity(entryPrice, stopPrice, FixedRiskUSD, CommissionMode == CommissionModeOption.On, CommissionPerContractRoundTurn, MaxContracts);
-                    LogDebug($"Sizing: qty {qty}, stopTicks {stopTicks:F1}, targetTicks {targetTicks:F1}, entryPrice={entryPrice:F2}, stopPrice={stopPrice:F2}, targetPrice={targetPrice:F2}, entryRef={entryRef:F2}");
+                    if (forceLog)
+                        forceSizingDebugLog = false;
+                    if (directional && stopTicks <= 0)
+                    {
+                        string qtyDisplay = Position.MarketPosition != MarketPosition.Flat && Position.Quantity != 0
+                            ? $"{Math.Abs(Position.Quantity)} contracts"
+                            : "N/A";
+                        LogDebug($"Sizing: risk-free stop (stopTicks<=0) -> risk=0, qtyDisplay={qtyDisplay}, targetTicks={targetTicks:F1}, entryPrice={entryPrice:F2}, stopPrice={stopPrice:F2}, targetPrice={targetPrice:F2}, entryRef={entryRef:F2}");
+                    }
+                    else
+                    {
+                        LogDebug($"Sizing: qty {qty}, stopTicks {stopTicks:F1}, targetTicks {targetTicks:F1}, entryPrice={entryPrice:F2}, stopPrice={stopPrice:F2}, targetPrice={targetPrice:F2}, entryRef={entryRef:F2}");
+                    }
                 }
             }
         }
