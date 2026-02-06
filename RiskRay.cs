@@ -126,10 +126,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         private const int FinalizeDragDuplicateSuppressMs = 100;
         private DateTime lastDragMoveLogStop = DateTime.MinValue;
         private DateTime lastDragMoveLogTarget = DateTime.MinValue;
+        private DateTime lastDebugBlinkLogTime = DateTime.MinValue;
         private DateTime lastMouseDragPulseUtc = DateTime.MinValue;
         private DateTime lastUserInteractionUtc = DateTime.MinValue;
         private const int MouseDragPulseThrottleMs = 20;
         private const int UserInteractionGraceMs = 200;
+        private const int DebugBlinkThrottleMs = 500;
         private DateTime lastLabelRefreshLogTime = DateTime.MinValue;
         private bool chartEventsAttached;
         // Dialog/blink/self-check guards that throttle popups and enforce safety invariants.
@@ -700,7 +702,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     buyButton.Opacity = blinkBuy ? (blinkOn ? 1 : 0.55) : 1;
                 if (sellButton != null)
                     sellButton.Opacity = blinkSell ? (blinkOn ? 1 : 0.55) : 1;
-                if (DebugBlink)
+                if (ShouldLogDebugBlink())
                     Print($"{Prefix("DEBUG")} UpdateUiState: blinkBuy={blinkBuy} blinkSell={blinkSell} phase={(blinkOn ? "on" : "off")}");
                 if (closeButton != null)
                 {
@@ -729,7 +731,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 blinkBuy = isArmed && armedDirection == ArmDirection.Long;
                 blinkSell = isArmed && armedDirection == ArmDirection.Short;
-                if (DebugBlink)
+                if (ShouldLogDebugBlink())
                     Print($"{Prefix("DEBUG")} UpdateArmButtonsUI: blinkBuy={blinkBuy} blinkSell={blinkSell} phase={(blinkOn ? "on" : "off")} btnNull buy:{buyButton == null} sell:{sellButton == null}");
                 if (buyButton != null)
                     buyButton.Content = (isArmed && armedDirection == ArmDirection.Long) ? "BUY ARMED" : "BUY";
@@ -1605,7 +1607,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool targetPriceMoved = HasLabelPriceMoved(targetPrice, lastTargetLabelPrice, priceTolerance);
 
             bool entryTextChanged = entryLabel != lastEntryLabel;
-            if (entryLabelDirty || entryTextChanged || entryPriceMoved)
+            bool entryNeedsLineRefresh = entryLabelDirty || entryPriceMoved;
+            bool entryNeedsLabelOnlyRefresh = !entryNeedsLineRefresh && entryTextChanged;
+            // Label-only refresh must not move anchors; prevents snap-back after drag.
+            if (entryNeedsLineRefresh)
             {
                 double oldEntryPrice = lastEntryLabelPrice;
                 chartLines.UpsertLine(RiskRayChartLines.LineKind.Entry, entryPrice, entryLabel);
@@ -1613,6 +1618,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastEntryLabelPrice = entryPrice;
                 entryLabelDirty = false;
                 LogLabelRefresh("ENTRY", entryTextChanged, entryPriceMoved, oldEntryPrice, entryPrice);
+            }
+            else if (entryNeedsLabelOnlyRefresh)
+            {
+                double oldEntryPrice = lastEntryLabelPrice;
+                chartLines.UpdateLineLabel(RiskRayChartLines.LineKind.Entry, entryLabel);
+                lastEntryLabel = entryLabel;
+                lastEntryLabelPrice = entryPrice;
+                LogLabelRefresh("ENTRY", true, false, oldEntryPrice, entryPrice);
             }
 
             bool stopTextChanged = stopLbl != lastStopLabel;
@@ -1687,7 +1700,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            if (DebugBlink)
+            if (ShouldLogDebugBlink())
             {
                 double tickDbg;
                 double tickValueDbg;
@@ -1745,6 +1758,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             if ((DateTime.Now - lastLabelRefreshLogTime).TotalMilliseconds < 200)
                 return false;
             lastLabelRefreshLogTime = DateTime.Now;
+            return true;
+        }
+
+        private bool ShouldLogDebugBlink()
+        {
+            if (!DebugBlink)
+                return false;
+            if ((DateTime.Now - lastDebugBlinkLogTime).TotalMilliseconds < DebugBlinkThrottleMs)
+                return false;
+            lastDebugBlinkLogTime = DateTime.Now;
             return true;
         }
 
