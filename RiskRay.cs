@@ -412,6 +412,55 @@ namespace NinjaTrader.NinjaScript.Strategies
             HUD
         }
 
+        private enum OrderFlowEventKind
+        {
+            ConfirmClicked,
+            EntryFullyFilled,
+            OrderRejected,
+            StopDragged,
+            TargetDragged,
+            BeClicked,
+            TrailClicked,
+            CloseClicked,
+            PositionFlat
+        }
+
+        private enum OrderFlowCommandKind
+        {
+            SubmitEntry,
+            SubmitExitBracket,
+            ChangeStop,
+            ChangeTarget,
+            CleanupAfterError,
+            ResetAndFlatten,
+            NoOp
+        }
+
+        private sealed class OrderFlowEvent
+        {
+            public OrderFlowEventKind Kind;
+            public string Fingerprint;
+            public string Scope;
+            public string Reason;
+            public OrderAction EntryAction;
+            public string EntryName;
+            public int Quantity;
+            public double StopPrice;
+            public double TargetPrice;
+            public Order Order;
+            public int OrderQuantity;
+            public double LimitPrice;
+            public double StopOrderPrice;
+        }
+
+        private sealed class OrderFlowCommand
+        {
+            public OrderFlowCommandKind Kind;
+            public string Fingerprint;
+            public TimeSpan DedupeTtl;
+            public Func<RiskRay, bool> Execute;
+        }
+
         // WPF panel wrapper for manual interaction and blink feedback.
         private RiskRayPanel panel;
 
@@ -537,6 +586,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private RiskRayChartLines chartLines;
         private RiskRayHud hud;
         private bool helpersInitLogged;
+        private readonly Dictionary<string, DateTime> orderFlowDedupByFingerprintUtc = new Dictionary<string, DateTime>();
+        private DateTime lastOrderFlowDedupPruneUtc = DateTime.MinValue;
 
         #endregion
 
@@ -723,6 +774,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     armedTargetOffsetTicks = 0;
                     dragFinalizePending = false;
                     lastUserInteractionUtc = DateTime.MinValue;
+                    orderFlowDedupByFingerprintUtc.Clear();
+                    lastOrderFlowDedupPruneUtc = DateTime.MinValue;
                 }
                 else if (State == State.Configure)
                 {
@@ -970,16 +1023,23 @@ namespace NinjaTrader.NinjaScript.Strategies
                             return;
                         }
 
-                        OrderAction stopAction = order.OrderAction == OrderAction.Buy ? OrderAction.Sell : OrderAction.BuyToCover;
-                        OrderAction targetAction = stopAction;
-                        SafeExecuteTrade("SubmitExitBracket", () =>
+                        string stopFp = RoundForFp(stop).ToString("G17", CultureInfo.InvariantCulture);
+                        string targetFp = RoundForFp(target).ToString("G17", CultureInfo.InvariantCulture);
+                        int did = HandleOrderFlowEvent(new OrderFlowEvent
                         {
-                            currentOco = Guid.NewGuid().ToString("N");
-                            stopOrder = SubmitOrderUnmanaged(0, stopAction, OrderType.StopMarket, qty, 0, stop, currentOco, tags.StopSignal);
-                            targetOrder = SubmitOrderUnmanaged(0, targetAction, OrderType.Limit, qty, target, 0, currentOco, tags.TargetSignal);
+                            Kind = OrderFlowEventKind.EntryFullyFilled,
+                            Scope = "SubmitExitBracket",
+                            Fingerprint = $"entryfill|{order.OrderId}|qty={qty}|stop={stopFp}|target={targetFp}",
+                            EntryAction = order.OrderAction,
+                            Quantity = qty,
+                            StopPrice = stop,
+                            TargetPrice = target
                         });
-                        RecordOrderAction($"Bracket submitted qty={qty} SL={stop:F2} TP={target:F2}");
-                        LogInfo($"Bracket submitted (full fill): qty={qty}, SL={stop:F2}, TP={target:F2}");
+                        if (did > 0)
+                        {
+                            RecordOrderAction($"Bracket submitted qty={qty} SL={stop:F2} TP={target:F2}");
+                            LogInfo($"Bracket submitted (full fill): qty={qty}, SL={stop:F2}, TP={target:F2}");
+                        }
                     }
                     else
                     {
@@ -1008,7 +1068,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     RecordOrderAction($"Order rejected {order.Name}: {nativeError ?? error.ToString()}");
                     LogInfo($"Order rejected ({order.Name}): {nativeError ?? error.ToString()}");
-                    CleanupAfterError();
+                    HandleOrderFlowEvent(new OrderFlowEvent
+                    {
+                        Kind = OrderFlowEventKind.OrderRejected,
+                        Fingerprint = $"rejected|{order.OrderId}|{order.Name}|{error}"
+                    });
                 }
             });
         }
@@ -1080,6 +1144,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     processedExitIds.Clear();
                     RemoveAllDrawObjects();
                     UpdateUiState();
+                    HandleOrderFlowEvent(new OrderFlowEvent
+                    {
+                        Kind = OrderFlowEventKind.PositionFlat,
+                        Fingerprint = "position-flat"
+                    });
                 }
             });
         }
@@ -1245,7 +1314,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     LogInfo("CLOSE start");
                     Print($"{Prefix()} CLOSE click received");
-                    ResetAndFlatten("UserClose");
+                    HandleOrderFlowEvent(new OrderFlowEvent
+                    {
+                        Kind = OrderFlowEventKind.CloseClicked,
+                        Fingerprint = $"close|UserClose|{Position.MarketPosition}|qty={Math.Abs(Position.Quantity)}",
+                        Reason = "UserClose"
+                    });
                     LogInfo("CLOSE end");
                 });
             }, null);
@@ -1573,8 +1647,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                     double currentStop = stopOrder.StopPrice;
                     if (Math.Abs(currentStop - stopPrice) >= sizing.TickSize() / 8)
                     {
-                        SafeExecuteTrade("ChangeOrder-StopDrag", () => ChangeOrder(stopOrder, stopOrder.Quantity, stopOrder.LimitPrice, stopPrice));
-                        LogInfo($"SL modified -> {stopPrice:F2}");
+                        int did = HandleOrderFlowEvent(new OrderFlowEvent
+                        {
+                            Kind = OrderFlowEventKind.StopDragged,
+                            Scope = "ChangeOrder-StopDrag",
+                            Fingerprint = $"stopdrag|{stopOrder.OrderId}|{RoundForFp(stopPrice).ToString("G17", CultureInfo.InvariantCulture)}",
+                            Order = stopOrder,
+                            OrderQuantity = stopOrder.Quantity,
+                            LimitPrice = stopOrder.LimitPrice,
+                            StopOrderPrice = stopPrice
+                        });
+                        if (did > 0)
+                            LogInfo($"SL modified -> {stopPrice:F2}");
                     }
                 }
             }
@@ -1596,7 +1680,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 LogDebugDrag("DragMove TP ->", targetPrice);
                 if (targetOrder != null && targetOrder.OrderState == OrderState.Working && EnsureSelfCheckPassed())
-                    SafeExecuteTrade("ChangeOrder-TargetDrag", () => ChangeOrder(targetOrder, targetOrder.Quantity, targetPrice, targetOrder.StopPrice));
+                {
+                    HandleOrderFlowEvent(new OrderFlowEvent
+                    {
+                        Kind = OrderFlowEventKind.TargetDragged,
+                        Scope = "ChangeOrder-TargetDrag",
+                        Fingerprint = $"targetdrag|{targetOrder.OrderId}|{RoundForFp(targetPrice).ToString("G17", CultureInfo.InvariantCulture)}",
+                        Order = targetOrder,
+                        OrderQuantity = targetOrder.Quantity,
+                        LimitPrice = targetPrice,
+                        StopOrderPrice = targetOrder.StopPrice
+                    });
+                }
             }
 
             if (clamped)
@@ -1628,6 +1723,216 @@ namespace NinjaTrader.NinjaScript.Strategies
         #region Order Management
 
         #region Orders
+
+        private int HandleOrderFlowEvent(OrderFlowEvent flowEvent)
+        {
+            if (flowEvent == null)
+                return 0;
+
+            List<OrderFlowCommand> commands = Decide(flowEvent);
+            return ApplyOrderFlowCommands(commands);
+        }
+
+        private int ApplyOrderFlowCommands(List<OrderFlowCommand> commands)
+        {
+            if (commands == null || commands.Count == 0)
+                return 0;
+
+            int executed = 0;
+            DateTime nowUtc = DateTime.UtcNow;
+            PruneOrderFlowDedupes(nowUtc);
+
+            foreach (OrderFlowCommand command in commands)
+            {
+                if (command == null)
+                    continue;
+
+                string fingerprint = command.Fingerprint;
+                if (!string.IsNullOrWhiteSpace(fingerprint) && command.DedupeTtl > TimeSpan.Zero)
+                {
+                    DateTime lastSeenUtc;
+                    if (orderFlowDedupByFingerprintUtc.TryGetValue(fingerprint, out lastSeenUtc)
+                        && (nowUtc - lastSeenUtc) < command.DedupeTtl)
+                    {
+                        continue;
+                    }
+                }
+
+                bool didRun = command.Execute != null && command.Execute(this);
+                if (!didRun)
+                    continue;
+
+                executed++;
+                if (!string.IsNullOrWhiteSpace(fingerprint) && command.DedupeTtl > TimeSpan.Zero)
+                    orderFlowDedupByFingerprintUtc[fingerprint] = nowUtc;
+            }
+
+            return executed;
+        }
+
+        private void PruneOrderFlowDedupes(DateTime nowUtc)
+        {
+            if (orderFlowDedupByFingerprintUtc.Count == 0)
+                return;
+            if (lastOrderFlowDedupPruneUtc != DateTime.MinValue && (nowUtc - lastOrderFlowDedupPruneUtc).TotalSeconds < 5)
+                return;
+
+            lastOrderFlowDedupPruneUtc = nowUtc;
+            List<string> expired = null;
+            foreach (KeyValuePair<string, DateTime> kv in orderFlowDedupByFingerprintUtc)
+            {
+                if ((nowUtc - kv.Value).TotalMinutes <= 2)
+                    continue;
+                if (expired == null)
+                    expired = new List<string>();
+                expired.Add(kv.Key);
+            }
+
+            if (expired == null)
+                return;
+            for (int i = 0; i < expired.Count; i++)
+                orderFlowDedupByFingerprintUtc.Remove(expired[i]);
+        }
+
+        private List<OrderFlowCommand> Decide(OrderFlowEvent flowEvent)
+        {
+            List<OrderFlowCommand> commands = new List<OrderFlowCommand>();
+            if (flowEvent == null)
+                return commands;
+
+            switch (flowEvent.Kind)
+            {
+                case OrderFlowEventKind.ConfirmClicked:
+                    commands.Add(new OrderFlowCommand
+                    {
+                        Kind = OrderFlowCommandKind.SubmitEntry,
+                        Fingerprint = flowEvent.Fingerprint,
+                        DedupeTtl = TimeSpan.FromMilliseconds(1500),
+                        Execute = strategy =>
+                        {
+                            bool didRun = false;
+                            strategy.SafeExecuteTrade(flowEvent.Scope ?? "SubmitOrders", () =>
+                            {
+                                didRun = true;
+                                strategy.entryOrder = strategy.SubmitOrderUnmanaged(0, flowEvent.EntryAction, OrderType.Market, flowEvent.Quantity, 0, 0, null, flowEvent.EntryName);
+                                strategy.stopOrder = null;
+                                strategy.targetOrder = null;
+                                strategy.currentOco = null;
+                            });
+                            return didRun;
+                        }
+                    });
+                    break;
+
+                case OrderFlowEventKind.EntryFullyFilled:
+                    commands.Add(new OrderFlowCommand
+                    {
+                        Kind = OrderFlowCommandKind.SubmitExitBracket,
+                        Fingerprint = flowEvent.Fingerprint,
+                        DedupeTtl = TimeSpan.FromMilliseconds(2000),
+                        Execute = strategy =>
+                        {
+                            bool didRun = false;
+                            strategy.SafeExecuteTrade(flowEvent.Scope ?? "SubmitExitBracket", () =>
+                            {
+                                didRun = true;
+                                OrderAction stopAction = flowEvent.EntryAction == OrderAction.Buy ? OrderAction.Sell : OrderAction.BuyToCover;
+                                strategy.currentOco = Guid.NewGuid().ToString("N");
+                                strategy.stopOrder = strategy.SubmitOrderUnmanaged(0, stopAction, OrderType.StopMarket, flowEvent.Quantity, 0, flowEvent.StopPrice, strategy.currentOco, strategy.tags.StopSignal);
+                                strategy.targetOrder = strategy.SubmitOrderUnmanaged(0, stopAction, OrderType.Limit, flowEvent.Quantity, flowEvent.TargetPrice, 0, strategy.currentOco, strategy.tags.TargetSignal);
+                            });
+                            return didRun;
+                        }
+                    });
+                    break;
+
+                case OrderFlowEventKind.OrderRejected:
+                    commands.Add(new OrderFlowCommand
+                    {
+                        Kind = OrderFlowCommandKind.CleanupAfterError,
+                        Fingerprint = flowEvent.Fingerprint,
+                        DedupeTtl = TimeSpan.FromMilliseconds(1500),
+                        Execute = strategy =>
+                        {
+                            strategy.CleanupAfterError();
+                            return true;
+                        }
+                    });
+                    break;
+
+                case OrderFlowEventKind.StopDragged:
+                case OrderFlowEventKind.BeClicked:
+                case OrderFlowEventKind.TrailClicked:
+                    commands.Add(new OrderFlowCommand
+                    {
+                        Kind = OrderFlowCommandKind.ChangeStop,
+                        Fingerprint = flowEvent.Fingerprint,
+                        DedupeTtl = flowEvent.Kind == OrderFlowEventKind.StopDragged
+                            ? TimeSpan.FromMilliseconds(120)
+                            : TimeSpan.FromMilliseconds(400),
+                        Execute = strategy =>
+                        {
+                            if (flowEvent.Order == null)
+                                return false;
+                            bool didRun = false;
+                            strategy.SafeExecuteTrade(flowEvent.Scope ?? "ChangeOrder-Stop", () =>
+                            {
+                                didRun = true;
+                                strategy.ChangeOrder(flowEvent.Order, flowEvent.OrderQuantity, flowEvent.LimitPrice, flowEvent.StopOrderPrice);
+                            });
+                            return didRun;
+                        }
+                    });
+                    break;
+
+                case OrderFlowEventKind.TargetDragged:
+                    commands.Add(new OrderFlowCommand
+                    {
+                        Kind = OrderFlowCommandKind.ChangeTarget,
+                        Fingerprint = flowEvent.Fingerprint,
+                        DedupeTtl = TimeSpan.FromMilliseconds(120),
+                        Execute = strategy =>
+                        {
+                            if (flowEvent.Order == null)
+                                return false;
+                            bool didRun = false;
+                            strategy.SafeExecuteTrade(flowEvent.Scope ?? "ChangeOrder-Target", () =>
+                            {
+                                didRun = true;
+                                strategy.ChangeOrder(flowEvent.Order, flowEvent.OrderQuantity, flowEvent.LimitPrice, flowEvent.StopOrderPrice);
+                            });
+                            return didRun;
+                        }
+                    });
+                    break;
+
+                case OrderFlowEventKind.CloseClicked:
+                    commands.Add(new OrderFlowCommand
+                    {
+                        Kind = OrderFlowCommandKind.ResetAndFlatten,
+                        Fingerprint = flowEvent.Fingerprint,
+                        DedupeTtl = TimeSpan.FromMilliseconds(750),
+                        Execute = strategy =>
+                        {
+                            strategy.ResetAndFlatten(flowEvent.Reason ?? "UserClose");
+                            return true;
+                        }
+                    });
+                    break;
+
+                case OrderFlowEventKind.PositionFlat:
+                    commands.Add(new OrderFlowCommand
+                    {
+                        Kind = OrderFlowCommandKind.NoOp,
+                        Fingerprint = flowEvent.Fingerprint,
+                        DedupeTtl = TimeSpan.Zero,
+                        Execute = strategy => false
+                    });
+                    break;
+            }
+
+            return commands;
+        }
 
         // CONFIRM step: clamps lines against market, computes quantity, and submits unmanaged entry + OCO stop/target with tag prefix (INVARIANT: self-check must pass and qty>=1).
         private void ConfirmEntry()
@@ -1688,15 +1993,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             lastConfirmEntryUtc = nowUtc;
 
-            SafeExecuteTrade("SubmitOrders", () =>
+            int did = HandleOrderFlowEvent(new OrderFlowEvent
             {
-                entryOrder = SubmitOrderUnmanaged(0, entryAction, OrderType.Market, qty, 0, 0, null, entryName);
-                stopOrder = null;
-                targetOrder = null;
-                currentOco = null;
+                Kind = OrderFlowEventKind.ConfirmClicked,
+                Scope = "SubmitOrders",
+                Fingerprint = $"confirm|{fingerprint}",
+                EntryAction = entryAction,
+                EntryName = entryName,
+                Quantity = qty
             });
 
-            if (fatalError || entryOrder == null)
+            if (fatalError || entryOrder == null || did <= 0)
             {
                 hasPendingEntry = false;
                 isArmed = true;
@@ -1805,8 +2112,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (IsOrderActive(stopOrder))
             {
-                SafeExecuteTrade("ChangeOrder-BE", () => ChangeOrder(stopOrder, stopOrder.Quantity, stopOrder.LimitPrice, stopPrice));
-                LogInfo($"BE pressed: stop moved to {stopPrice:F2}" + (clamped ? " (clamped)" : string.Empty));
+                int did = HandleOrderFlowEvent(new OrderFlowEvent
+                {
+                    Kind = OrderFlowEventKind.BeClicked,
+                    Scope = "ChangeOrder-BE",
+                    Fingerprint = $"be|{stopOrder.OrderId}|{RoundForFp(stopPrice).ToString("G17", CultureInfo.InvariantCulture)}",
+                    Order = stopOrder,
+                    OrderQuantity = stopOrder.Quantity,
+                    LimitPrice = stopOrder.LimitPrice,
+                    StopOrderPrice = stopPrice
+                });
+                if (did > 0)
+                    LogInfo($"BE pressed: stop moved to {stopPrice:F2}" + (clamped ? " (clamped)" : string.Empty));
             }
             else
             {
@@ -1851,8 +2168,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (IsOrderActive(stopOrder))
             {
-                SafeExecuteTrade("ChangeOrder-TRAIL", () => ChangeOrder(stopOrder, stopOrder.Quantity, stopOrder.LimitPrice, stopPrice));
-                LogInfo($"TRAIL pressed: move SL to {stopPrice:F2} (offset {TrailOffsetTicks} ticks from {refPrice:F2})");
+                int did = HandleOrderFlowEvent(new OrderFlowEvent
+                {
+                    Kind = OrderFlowEventKind.TrailClicked,
+                    Scope = "ChangeOrder-TRAIL",
+                    Fingerprint = $"trail|{stopOrder.OrderId}|{RoundForFp(stopPrice).ToString("G17", CultureInfo.InvariantCulture)}",
+                    Order = stopOrder,
+                    OrderQuantity = stopOrder.Quantity,
+                    LimitPrice = stopOrder.LimitPrice,
+                    StopOrderPrice = stopPrice
+                });
+                if (did > 0)
+                    LogInfo($"TRAIL pressed: move SL to {stopPrice:F2} (offset {TrailOffsetTicks} ticks from {refPrice:F2})");
             }
             else
             {
@@ -3008,11 +3335,32 @@ namespace NinjaTrader.NinjaScript.Strategies
                         LogClampOnce("Line clamped at drag end");
                     if (IsOrderActive(stopOrder) && Position.MarketPosition != MarketPosition.Flat && EnsureSelfCheckPassed())
                     {
-                        SafeExecuteTrade("ChangeOrder-StopDragEnd", () => ChangeOrder(stopOrder, stopOrder.Quantity, stopOrder.LimitPrice, stopPrice));
-                        LogInfo($"SL modified -> {stopPrice:F2}");
+                        int did = HandleOrderFlowEvent(new OrderFlowEvent
+                        {
+                            Kind = OrderFlowEventKind.StopDragged,
+                            Scope = "ChangeOrder-StopDragEnd",
+                            Fingerprint = $"stopdrag|{stopOrder.OrderId}|{RoundForFp(stopPrice).ToString("G17", CultureInfo.InvariantCulture)}",
+                            Order = stopOrder,
+                            OrderQuantity = stopOrder.Quantity,
+                            LimitPrice = stopOrder.LimitPrice,
+                            StopOrderPrice = stopPrice
+                        });
+                        if (did > 0)
+                            LogInfo($"SL modified -> {stopPrice:F2}");
                     }
                     if (targetOrder != null && targetOrder.OrderState == OrderState.Working && EnsureSelfCheckPassed())
-                        SafeExecuteTrade("ChangeOrder-TargetDragEnd", () => ChangeOrder(targetOrder, targetOrder.Quantity, targetPrice, targetOrder.StopPrice));
+                    {
+                        HandleOrderFlowEvent(new OrderFlowEvent
+                        {
+                            Kind = OrderFlowEventKind.TargetDragged,
+                            Scope = "ChangeOrder-TargetDragEnd",
+                            Fingerprint = $"targetdrag|{targetOrder.OrderId}|{RoundForFp(targetPrice).ToString("G17", CultureInfo.InvariantCulture)}",
+                            Order = targetOrder,
+                            OrderQuantity = targetOrder.Quantity,
+                            LimitPrice = targetPrice,
+                            StopOrderPrice = targetOrder.StopPrice
+                        });
+                    }
                 }
 
                 isDraggingStop = false;
