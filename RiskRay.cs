@@ -699,6 +699,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private const int UiStateLogHeartbeatMs = 5000;
         private const int ModifyBlockLogThrottleMs = 600;
         private DateTime lastFailSafeFlattenAttemptUtc = DateTime.MinValue;
+        private bool failSafeFlattenAttemptedThisEpisode;
         private DateTime lastFailSafeFlattenThrottleLogUtc = DateTime.MinValue;
         private const int FailSafeFlattenThrottleMs = 1000;
 
@@ -910,6 +911,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     lastUiStateSignature = null;
                     lastUiStateLogTime = DateTime.MinValue;
                     lastFailSafeFlattenAttemptUtc = DateTime.MinValue;
+                    failSafeFlattenAttemptedThisEpisode = false;
                     lastFailSafeFlattenThrottleLogUtc = DateTime.MinValue;
                 }
                 else if (State == State.Configure)
@@ -1498,6 +1500,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     bracketIncompleteHandled = false;
                     lastFailSafeFlattenAttemptUtc = DateTime.MinValue;
+                    failSafeFlattenAttemptedThisEpisode = false;
                     lastFailSafeFlattenThrottleLogUtc = DateTime.MinValue;
                     avgEntryPrice = 0;
                     lastEntryFillPrice = 0;
@@ -3096,7 +3099,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
 
             DateTime nowUtc = DateTime.UtcNow;
-            if (lastFailSafeFlattenAttemptUtc != DateTime.MinValue
+            // First attempt per episode is not throttled; subsequent are throttled.
+            if (failSafeFlattenAttemptedThisEpisode
+                && lastFailSafeFlattenAttemptUtc != DateTime.MinValue
                 && (nowUtc - lastFailSafeFlattenAttemptUtc).TotalMilliseconds < FailSafeFlattenThrottleMs)
             {
                 if (lastFailSafeFlattenThrottleLogUtc == DateTime.MinValue
@@ -3107,6 +3112,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 return;
             }
+            failSafeFlattenAttemptedThisEpisode = true;
             lastFailSafeFlattenAttemptUtc = nowUtc;
             if (!bracketIncompleteHandled)
                 bracketIncompleteHandled = true;
