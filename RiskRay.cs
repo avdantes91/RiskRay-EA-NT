@@ -9,6 +9,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
+using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -438,6 +439,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lastDebugLogTime = DateTime.MinValue;
         private DateTime lastQtyBlockLogTime = DateTime.MinValue;
         private DateTime lastEntryLineLogTime = DateTime.MinValue;
+        private DateTime lastConfirmEntryUtc = DateTime.MinValue;
+        private string lastConfirmFingerprint = null;
+        private DateTime lastConfirmFingerprintUtc = DateTime.MinValue;
         private const int EntryLineLogThrottleMs = 500;
 
         // Chart attachment state and suppression flags used while programmatically moving lines.
@@ -1666,6 +1670,23 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             OrderAction entryAction = armedDirection == ArmDirection.Long ? OrderAction.Buy : OrderAction.SellShort;
             string entryName = armedDirection == ArmDirection.Long ? tags.EntrySignalLong : tags.EntrySignalShort;
+            string instr = (Instrument?.FullName ?? string.Empty).Trim();
+            string entryR = RoundForFp(sizing.RoundToTick(entryPrice)).ToString("G17", CultureInfo.InvariantCulture);
+            string stopR = RoundForFp(sizing.RoundToTick(stopPrice)).ToString("G17", CultureInfo.InvariantCulture);
+            string tgtR = RoundForFp(sizing.RoundToTick(targetPrice)).ToString("G17", CultureInfo.InvariantCulture);
+            string fingerprint = $"{instr}|{armedDirection}|qty={qty}|entry={entryR}|stop={stopR}|target={tgtR}";
+            DateTime nowUtc = DateTime.UtcNow;
+            if ((nowUtc - lastConfirmEntryUtc).TotalMilliseconds < 400)
+            {
+                LogDebug("ConfirmEntry throttled");
+                return;
+            }
+            if (lastConfirmFingerprint == fingerprint && (nowUtc - lastConfirmFingerprintUtc).TotalMilliseconds < 1500)
+            {
+                LogDebug("ConfirmEntry deduped");
+                return;
+            }
+            lastConfirmEntryUtc = nowUtc;
 
             SafeExecuteTrade("SubmitOrders", () =>
             {
@@ -1675,6 +1696,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 currentOco = null;
             });
 
+            if (fatalError || entryOrder == null)
+            {
+                hasPendingEntry = false;
+                isArmed = true;
+                armedDirection = entryAction == OrderAction.Buy ? ArmDirection.Long : ArmDirection.Short;
+                UpdateUiState();
+                LogInfo("Entry submit failed; pending not set");
+                return;
+            }
+
+            lastConfirmFingerprint = fingerprint;
+            lastConfirmFingerprintUtc = nowUtc;
             isArmed = false;
             hasPendingEntry = true;
             UpdateUiState();
@@ -1684,6 +1717,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             ApplyLineUpdates();
             UpdateLabelsOnly();
             SetMilestone("ConfirmEntry-End");
+        }
+
+        private double RoundForFp(double price)
+        {
+            if (sizing == null)
+                return price;
+            return sizing.RoundToTick(price);
         }
 
         // CLOSE flow: cancels working entry/exit orders, flattens position, and clears HUD/arming state.
