@@ -4,6 +4,17 @@
 // Components: WPF panel with blink feedback, risk-based sizing, draggable entry/SL/TP lines with clamps, unmanaged submission/tracking, and BE/TRAIL/CLOSE flows.
 // Safety updates: split UI vs trade-safe execution, UI-unavailable latch, fatal trade guard + notifications,
 // and on-demand diagnostic snapshots for bracket issues and critical exceptions.
+/*
+Phase 4 Manual Test Checklist (NT8)
+1) ARM/CONFIRM cycle: run BUY and SELL flows and confirm a single entry submit each time.
+2) Drag SL/TP with active bracket: verify line changes propagate to ChangeOrder without spam loops.
+3) BE action: verify blocks when not profitable and moves SL to BE when profitable.
+4) TRAIL action: verify stop moves relative to market only when stop order is active.
+5) CLOSE action: verify single-click closes and spam-click does not duplicate close orders.
+6) Chart lifecycle: close/reopen chart tab and verify no stale callbacks or UI-thread exceptions.
+7) Replay/enable-disable: verify cleanup in Terminated and re-enable starts cleanly.
+8) Diagnostics: verify detach logs are truthful ("scheduled" vs "detached") and snapshots contain order/OCO state.
+*/
 
 using System;
 using System.Collections.Generic;
@@ -702,6 +713,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool failSafeFlattenAttemptedThisEpisode;
         private DateTime lastFailSafeFlattenThrottleLogUtc = DateTime.MinValue;
         private const int FailSafeFlattenThrottleMs = 1000;
+        private string lastAdoptionStatus;
+        private DateTime lastAdoptionStatusUtc = DateTime.MinValue;
 
         #endregion
 
@@ -913,6 +926,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     lastFailSafeFlattenAttemptUtc = DateTime.MinValue;
                     failSafeFlattenAttemptedThisEpisode = false;
                     lastFailSafeFlattenThrottleLogUtc = DateTime.MinValue;
+                    lastAdoptionStatus = null;
+                    lastAdoptionStatusUtc = DateTime.MinValue;
                 }
                 else if (State == State.Configure)
                 {
@@ -939,9 +954,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                         Print($"{Prefix("TRACE")} State.Realtime begin");
                     TryMarkRunningInstance();
                     SetMilestone("Realtime");
+                    EnsureHelpers();
+                    TryAdoptExistingPositionAndBracket();
                     RunSelfCheckOnce();
                     SafeExecuteUI("StartBlinkTimer", StartBlinkTimer);
                     SafeExecuteUI("AttachChartEvents", AttachChartEvents);
+                    UpdateUiState();
                     if (LogLevelSetting == LogLevelOption.Debug)
                         Print($"{Prefix("TRACE")} State.Realtime end");
                 }
@@ -3839,6 +3857,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             return $"{lastExceptionScope}: {lastException.GetType().Name} {lastException.Message} ({age})";
         }
 
+        private string OrderSnapshot(Order order, string expectedName)
+        {
+            if (order == null)
+                return $"{expectedName}:null";
+
+            string orderId = string.IsNullOrWhiteSpace(order.OrderId) ? "n/a" : order.OrderId;
+            string name = string.IsNullOrWhiteSpace(order.Name) ? expectedName : order.Name;
+            return $"{name}:id={orderId},state={order.OrderState},qty={order.Quantity},filled={order.Filled}";
+        }
+
+        private void SetAdoptionStatus(string status)
+        {
+            lastAdoptionStatus = status;
+            lastAdoptionStatusUtc = DateTime.UtcNow;
+            if (!string.IsNullOrWhiteSpace(status))
+                RecordDiagEvent($"ADOPT {status}");
+        }
+
         private string BuildTerminationSnapshot(string reason, string cleanupMode, bool chartNull, bool dispatcherOk, bool precededByTransition)
         {
             string lastUi = string.IsNullOrWhiteSpace(lastUiEvent) ? "none" : lastUiEvent;
@@ -3861,11 +3897,23 @@ namespace NinjaTrader.NinjaScript.Strategies
             string pendingCleanup = uiCleanupPending
                 ? $"{uiCleanupPendingReason ?? "pending"} since {uiCleanupPendingSinceUtc:O}"
                 : "none";
+            string oco = string.IsNullOrWhiteSpace(currentOco) ? "none" : currentOco;
+            string orderHandles =
+                $"{OrderSnapshot(entryOrder, tags != null ? tags.EntrySignalLong + "/" + tags.EntrySignalShort : "ENTRY")}; " +
+                $"{OrderSnapshot(stopOrder, tags != null ? tags.StopSignal : "SL")}; " +
+                $"{OrderSnapshot(targetOrder, tags != null ? tags.TargetSignal : "TP")}";
+            string adoption = string.IsNullOrWhiteSpace(lastAdoptionStatus)
+                ? "none"
+                : $"{lastAdoptionStatus} @ {lastAdoptionStatusUtc:O}";
             return
                 $"  reason={reason}\n" +
                 $"  cleanup={cleanupMode}\n" +
                 $"  coreCleanup={lastTerminationCoreCleanup}\n" +
                 $"  uiCleanup={lastTerminationUiCleanup}\n" +
+                $"  activeTradeCycleId={activeTradeCycleId}\n" +
+                $"  currentOco={oco}\n" +
+                $"  orderHandles={orderHandles}\n" +
+                $"  adoption={adoption}\n" +
                 $"  fatalError={fatalError} fatalNotified={fatalNotified}\n" +
                 $"  uiUnavailablePermanently={uiUnavailablePermanently}\n" +
                 $"  chartDetachObserved={chartDetach}\n" +
@@ -3903,6 +3951,281 @@ namespace NinjaTrader.NinjaScript.Strategies
             RecordDiagEvent($"HOT_FUSE {reason}");
             if (!uiUnavailablePermanently && CanTouchUi())
                 SafeExecuteUI("HotFuse.Notify", () => NotifyFatalOnce(message));
+        }
+
+        private bool IsSameInstrument(Instrument a, Instrument b)
+        {
+            if (a == null || b == null)
+                return false;
+            if (ReferenceEquals(a, b))
+                return true;
+
+            string aName = !string.IsNullOrWhiteSpace(a.FullName) ? a.FullName : a.MasterInstrument?.Name;
+            string bName = !string.IsNullOrWhiteSpace(b.FullName) ? b.FullName : b.MasterInstrument?.Name;
+            if (string.IsNullOrWhiteSpace(aName) || string.IsNullOrWhiteSpace(bName))
+                return false;
+            return string.Equals(aName, bName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private bool IsAdoptableOrderState(OrderState state)
+        {
+            return state == OrderState.Submitted
+                || state == OrderState.Accepted
+                || state == OrderState.Working
+                || state == OrderState.PartFilled;
+        }
+
+        private bool IsStopOrderType(OrderType type)
+        {
+            return type == OrderType.StopMarket || type == OrderType.StopLimit;
+        }
+
+        private bool IsExitActionForPosition(OrderAction action, MarketPosition positionSide)
+        {
+            if (positionSide == MarketPosition.Long)
+                return action == OrderAction.Sell;
+            if (positionSide == MarketPosition.Short)
+                return action == OrderAction.Buy || action == OrderAction.BuyToCover;
+            return false;
+        }
+
+        private int GetOrderAdoptionNameScore(Order order, bool isStop)
+        {
+            if (order == null || string.IsNullOrWhiteSpace(order.Name))
+                return 0;
+
+            string name = order.Name;
+            int score = 0;
+            string normalizedPrefix = NormalizedPrefix();
+            if (!string.IsNullOrWhiteSpace(normalizedPrefix) && name.StartsWith(normalizedPrefix, StringComparison.OrdinalIgnoreCase))
+                score += 30;
+            if (name.StartsWith("RR_", StringComparison.OrdinalIgnoreCase))
+                score += 20;
+
+            string expected = tags == null ? null : (isStop ? tags.StopSignal : tags.TargetSignal);
+            if (!string.IsNullOrWhiteSpace(expected))
+            {
+                if (string.Equals(name, expected, StringComparison.OrdinalIgnoreCase))
+                    score += 100;
+                else if (name.IndexOf(expected, StringComparison.OrdinalIgnoreCase) >= 0)
+                    score += 60;
+            }
+
+            if (isStop && name.IndexOf("SL", StringComparison.OrdinalIgnoreCase) >= 0)
+                score += 10;
+            if (!isStop && name.IndexOf("TP", StringComparison.OrdinalIgnoreCase) >= 0)
+                score += 10;
+            return score;
+        }
+
+        private bool TrySelectAdoptableBracket(List<Order> stopCandidates, List<Order> targetCandidates, out Order adoptedStop, out Order adoptedTarget, out string reason)
+        {
+            adoptedStop = null;
+            adoptedTarget = null;
+            reason = null;
+
+            int bestScore = int.MinValue;
+            bool bestAmbiguous = false;
+            for (int i = 0; i < stopCandidates.Count; i++)
+            {
+                Order stop = stopCandidates[i];
+                if (stop == null || string.IsNullOrWhiteSpace(stop.Oco))
+                    continue;
+
+                for (int j = 0; j < targetCandidates.Count; j++)
+                {
+                    Order target = targetCandidates[j];
+                    if (target == null || string.IsNullOrWhiteSpace(target.Oco))
+                        continue;
+                    if (!string.Equals(stop.Oco, target.Oco, StringComparison.Ordinal))
+                        continue;
+
+                    int score = GetOrderAdoptionNameScore(stop, true) + GetOrderAdoptionNameScore(target, false);
+                    if (score <= 0)
+                        continue;
+
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        adoptedStop = stop;
+                        adoptedTarget = target;
+                        bestAmbiguous = false;
+                    }
+                    else if (score == bestScore)
+                    {
+                        bestAmbiguous = true;
+                    }
+                }
+            }
+
+            if (adoptedStop != null && adoptedTarget != null && !bestAmbiguous)
+            {
+                reason = "name-match";
+                return true;
+            }
+
+            if (bestAmbiguous)
+            {
+                adoptedStop = null;
+                adoptedTarget = null;
+                reason = "name-ambiguous";
+                return false;
+            }
+
+            Dictionary<string, int> stopCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            Dictionary<string, int> targetCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            Dictionary<string, Order> stopByOco = new Dictionary<string, Order>(StringComparer.Ordinal);
+            Dictionary<string, Order> targetByOco = new Dictionary<string, Order>(StringComparer.Ordinal);
+
+            for (int i = 0; i < stopCandidates.Count; i++)
+            {
+                Order stop = stopCandidates[i];
+                if (stop == null || string.IsNullOrWhiteSpace(stop.Oco))
+                    continue;
+                int count;
+                stopCounts.TryGetValue(stop.Oco, out count);
+                stopCounts[stop.Oco] = count + 1;
+                if (!stopByOco.ContainsKey(stop.Oco))
+                    stopByOco[stop.Oco] = stop;
+            }
+
+            for (int i = 0; i < targetCandidates.Count; i++)
+            {
+                Order target = targetCandidates[i];
+                if (target == null || string.IsNullOrWhiteSpace(target.Oco))
+                    continue;
+                int count;
+                targetCounts.TryGetValue(target.Oco, out count);
+                targetCounts[target.Oco] = count + 1;
+                if (!targetByOco.ContainsKey(target.Oco))
+                    targetByOco[target.Oco] = target;
+            }
+
+            string coherentOco = null;
+            foreach (KeyValuePair<string, int> kv in stopCounts)
+            {
+                int targetCount;
+                if (!targetCounts.TryGetValue(kv.Key, out targetCount))
+                    continue;
+                if (kv.Value == 1 && targetCount == 1)
+                {
+                    if (coherentOco != null)
+                    {
+                        reason = "oco-ambiguous";
+                        return false;
+                    }
+                    coherentOco = kv.Key;
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(coherentOco))
+            {
+                reason = "oco-no-coherent-pair";
+                return false;
+            }
+
+            adoptedStop = stopByOco[coherentOco];
+            adoptedTarget = targetByOco[coherentOco];
+            reason = "oco-fallback";
+            return true;
+        }
+
+        private bool TryAdoptExistingPositionAndBracket()
+        {
+            try
+            {
+                if (State != State.Realtime)
+                    return false;
+                if (Position == null || Position.MarketPosition == MarketPosition.Flat)
+                    return false;
+                if (Account == null)
+                {
+                    SetAdoptionStatus("ADOPT_FAILED reason=AccountNull");
+                    LogInfo("ADOPT_FAILED reason=AccountNull");
+                    return false;
+                }
+                if (Instrument == null)
+                {
+                    SetAdoptionStatus("ADOPT_FAILED reason=InstrumentNull");
+                    LogInfo("ADOPT_FAILED reason=InstrumentNull");
+                    return false;
+                }
+
+                List<Order> stopCandidates = new List<Order>();
+                List<Order> targetCandidates = new List<Order>();
+                int scanned = 0;
+                foreach (Order order in Account.Orders)
+                {
+                    if (order == null)
+                        continue;
+                    scanned++;
+                    if (!IsAdoptableOrderState(order.OrderState))
+                        continue;
+                    if (!IsSameInstrument(order.Instrument, Instrument))
+                        continue;
+                    if (!IsExitActionForPosition(order.OrderAction, Position.MarketPosition))
+                        continue;
+
+                    if (IsStopOrderType(order.OrderType))
+                        stopCandidates.Add(order);
+                    else if (order.OrderType == OrderType.Limit)
+                        targetCandidates.Add(order);
+                }
+
+                if (stopCandidates.Count == 0 || targetCandidates.Count == 0)
+                {
+                    string reason = $"ADOPT_FAILED reason=NoBracketCandidates scanned={scanned} stop={stopCandidates.Count} target={targetCandidates.Count}";
+                    SetAdoptionStatus(reason);
+                    LogInfo(reason);
+                    return false;
+                }
+
+                Order adoptedStop;
+                Order adoptedTarget;
+                string selectReason;
+                if (!TrySelectAdoptableBracket(stopCandidates, targetCandidates, out adoptedStop, out adoptedTarget, out selectReason))
+                {
+                    string reason = $"ADOPT_FAILED reason={selectReason} stop={stopCandidates.Count} target={targetCandidates.Count}";
+                    SetAdoptionStatus(reason);
+                    LogInfo(reason);
+                    return false;
+                }
+
+                stopOrder = adoptedStop;
+                targetOrder = adoptedTarget;
+                currentOco = string.IsNullOrWhiteSpace(adoptedStop?.Oco) ? adoptedTarget?.Oco : adoptedStop.Oco;
+                hasPendingEntry = false;
+                isArmed = false;
+                armedDirection = ArmDirection.None;
+                entryOrder = null;
+
+                if (Position.AveragePrice > 0)
+                    avgEntryPrice = Position.AveragePrice;
+                if (avgEntryPrice > 0)
+                {
+                    lastEntryFillPrice = avgEntryPrice;
+                    entryFillConfirmed = true;
+                }
+
+                if (activeTradeCycleId <= 0)
+                    EnsureTradeCycle("AdoptExistingPosition");
+
+                string success =
+                    $"ADOPT_SUCCESS side={Position.MarketPosition} qty={Math.Abs(Position.Quantity)} avg={Position.AveragePrice:F2} " +
+                    $"stopId={adoptedStop.OrderId ?? "n/a"} stopState={adoptedStop.OrderState} " +
+                    $"targetId={adoptedTarget.OrderId ?? "n/a"} targetState={adoptedTarget.OrderState} " +
+                    $"oco={currentOco ?? "none"} mode={selectReason}";
+                SetAdoptionStatus(success);
+                LogInfo(success);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                string message = $"ADOPT_FAILED reason=Exception type={ex.GetType().Name} message={ex.Message}";
+                SetAdoptionStatus(message);
+                LogInfo(message);
+                return false;
+            }
         }
 
         // Level-gated info logger for user actions and state transitions.
