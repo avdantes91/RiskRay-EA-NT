@@ -1745,6 +1745,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             TriggerCustomEvent(_ =>
             {
                 RecordUiEvent("CLOSE");
+                if (State != State.Realtime)
+                {
+                    LogInfo($"CLOSE blocked: NotRealtime state={State}");
+                    return;
+                }
                 LogInfo("[UI] UserClick: CLOSE");
                 forceSizingDebugLog = true;
                 SafeExecuteTrade("OnCloseClicked", () =>
