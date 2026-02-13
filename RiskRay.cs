@@ -83,6 +83,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool uiLoaded;
         private DispatcherTimer blinkTimer;
         private EventHandler blinkTickHandler;
+        private int blinkGeneration;
         private bool blinkOn;
         private bool blinkBuy;
         private bool blinkSell;
@@ -234,8 +235,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 host.SetMilestone("DisposeUi-End");
             };
 
-            if (forceSync)
-                host.UiInvoke(() => host.SafeExecuteUI("DisposeUi", disposer));
+            bool canRunInline = forceSync
+                && host.ChartControl != null
+                && host.ChartControl.Dispatcher != null
+                && host.ChartControl.Dispatcher.CheckAccess();
+            if (canRunInline)
+                host.SafeExecuteUI("DisposeUi", disposer);
             else
                 host.UiBeginInvoke(() => host.SafeExecuteUI("DisposeUi", disposer));
         }
@@ -290,46 +295,44 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void UpdateArmButtonsUI()
         {
-            if (host.ChartControl == null || !uiLoaded)
-                return;
-
-            host.UiBeginInvoke(() =>
-            {
-                host.SafeExecuteUI("UpdateArmButtonsUI", () =>
-                {
-                    blinkBuy = host.IsArmedLong;
-                    blinkSell = host.IsArmedShort;
-                    if (host.ShouldLogDebugBlink())
-                        host.Print($"{host.Prefix("DEBUG")} UpdateArmButtonsUI: blinkBuy={blinkBuy} blinkSell={blinkSell} phase={(blinkOn ? "on" : "off")} btnNull buy:{buyButton == null} sell:{sellButton == null}");
-                    if (buyButton != null)
-                        buyButton.Content = host.IsArmedLong ? "BUY ARMED" : "BUY";
-                    if (sellButton != null)
-                        sellButton.Content = host.IsArmedShort ? "SELL ARMED" : "SELL";
-                    if (buyButton != null)
-                        buyButton.Opacity = blinkBuy ? (blinkOn ? 1 : 0.55) : 1;
-                    if (sellButton != null)
-                        sellButton.Opacity = blinkSell ? (blinkOn ? 1 : 0.55) : 1;
-                });
-            });
+            blinkBuy = host.IsArmedLong;
+            blinkSell = host.IsArmedShort;
+            if (host.ShouldLogDebugBlink())
+                host.Print($"{host.Prefix("DEBUG")} UpdateArmButtonsUI: blinkBuy={blinkBuy} blinkSell={blinkSell} phase={(blinkOn ? "on" : "off")} btnNull buy:{buyButton == null} sell:{sellButton == null}");
+            if (buyButton != null)
+                buyButton.Content = host.IsArmedLong ? "BUY ARMED" : "BUY";
+            if (sellButton != null)
+                sellButton.Content = host.IsArmedShort ? "SELL ARMED" : "SELL";
+            if (buyButton != null)
+                buyButton.Opacity = blinkBuy ? (blinkOn ? 1 : 0.55) : 1;
+            if (sellButton != null)
+                sellButton.Opacity = blinkSell ? (blinkOn ? 1 : 0.55) : 1;
         }
 
         public void StartBlinkTimer()
         {
-            host.UiInvoke(() =>
+            host.UiBeginInvoke(() =>
             {
                 if (blinkTimer != null || host.ChartControl == null || host.ChartControl.Dispatcher == null)
                     return;
+                if (host.ChartControl.Dispatcher.HasShutdownStarted)
+                    return;
 
                 host.SetMilestone("StartBlinkTimer");
-                blinkTimer = new DispatcherTimer(DispatcherPriority.Normal, host.ChartControl.Dispatcher)
+                DispatcherTimer timer = new DispatcherTimer(DispatcherPriority.Normal, host.ChartControl.Dispatcher)
                 {
                     Interval = TimeSpan.FromMilliseconds(500)
                 };
-                blinkTickHandler = (s, e) =>
+                int generation = Interlocked.Increment(ref blinkGeneration);
+                EventHandler tickHandler = (s, e) =>
                 {
                     blinkTickCounter++;
                     host.SafeExecuteUI("BlinkTimer", () =>
                     {
+                        if (generation != Volatile.Read(ref blinkGeneration))
+                            return;
+                        if (!ReferenceEquals(blinkTimer, timer))
+                            return;
                         if (!host.IsArmed)
                             return;
 
@@ -341,100 +344,67 @@ namespace NinjaTrader.NinjaScript.Strategies
                         UpdateUiState();
                     });
                 };
-                blinkTimer.Tick += blinkTickHandler;
-                blinkTimer.Start();
+                blinkTimer = timer;
+                blinkTickHandler = tickHandler;
+                timer.Tick += tickHandler;
+                timer.Start();
                 host.LogInfo("Blink timer started");
             });
         }
 
         public void StopBlinkTimer()
         {
-            if (blinkTimer != null && (host.ChartControl == null || host.ChartControl.Dispatcher == null || host.ChartControl.Dispatcher.HasShutdownStarted))
+            // Why this avoids hangs:
+            // clear timer refs first, then request teardown asynchronously on timer dispatcher.
+            // No caller waits on dispatcher while chart is busy rendering/panning.
+            DispatcherTimer timerRef = Interlocked.Exchange(ref blinkTimer, null);
+            EventHandler tickRef = Interlocked.Exchange(ref blinkTickHandler, null);
+            Interlocked.Increment(ref blinkGeneration);
+            ResetBlinkState();
+            host.SetMilestone("StopBlinkTimer");
+            if (timerRef == null)
+                return;
+
+            Action stopAction = () =>
             {
-                DispatcherTimer timerRef = blinkTimer;
-                EventHandler tickRef = blinkTickHandler;
-                Dispatcher timerDispatcher = timerRef.Dispatcher;
-                bool stoppedOnOwner = false;
-                if (timerDispatcher != null && !timerDispatcher.HasShutdownStarted)
+                try
                 {
-                    try
-                    {
-                        Action stopAction = () =>
-                        {
-                            try
-                            {
-                                if (tickRef != null)
-                                    timerRef.Tick -= tickRef;
-                            }
-                            catch (Exception)
-                            {
-                                // Best-effort teardown on timer owner dispatcher.
-                            }
-                            try
-                            {
-                                timerRef.Stop();
-                            }
-                            catch (Exception)
-                            {
-                                // Best-effort teardown on timer owner dispatcher.
-                            }
-                        };
-
-                        if (timerDispatcher.CheckAccess())
-                            stopAction();
-                        else
-                            timerDispatcher.Invoke(stopAction);
-
-                        stoppedOnOwner = true;
-                    }
-                    catch (Exception)
-                    {
-                        stoppedOnOwner = false;
-                    }
+                    if (tickRef != null)
+                        timerRef.Tick -= tickRef;
                 }
-                if (!stoppedOnOwner)
+                catch (Exception)
                 {
-                    try
-                    {
-                        if (tickRef != null)
-                            timerRef.Tick -= tickRef;
-                    }
-                    catch (Exception)
-                    {
-                        // No dispatcher available; best-effort local detach only.
-                    }
-                    try
-                    {
-                        timerRef.Stop();
-                    }
-                    catch (Exception)
-                    {
-                        // No dispatcher available; best-effort local stop only.
-                    }
+                    // Best-effort detach on timer owner dispatcher.
                 }
-                blinkTimer = null;
-                blinkTickHandler = null;
-                ResetBlinkState();
+                try
+                {
+                    timerRef.Stop();
+                }
+                catch (Exception)
+                {
+                    // Best-effort stop on timer owner dispatcher.
+                }
+            };
+
+            Dispatcher timerDispatcher = timerRef.Dispatcher;
+            if (timerDispatcher == null || timerDispatcher.HasShutdownStarted)
+            {
+                stopAction();
                 return;
             }
 
-            host.UiInvoke(() =>
+            try
             {
-                host.SafeExecuteUI("StopBlinkTimer", () =>
-                {
-                    if (blinkTimer == null)
-                        return;
-
-                    if (blinkTickHandler != null)
-                        blinkTimer.Tick -= blinkTickHandler;
-                    blinkTimer.Stop();
-                    blinkTimer = null;
-                    blinkTickHandler = null;
-                    ResetBlinkState();
-                    host.SetMilestone("StopBlinkTimer");
-                    host.LogInfo("Blink timer stopped");
-                });
-            });
+                if (timerDispatcher.CheckAccess())
+                    stopAction();
+                else
+                    timerDispatcher.InvokeAsync(stopAction, DispatcherPriority.Background);
+                host.LogInfo("Blink timer stop requested");
+            }
+            catch (Exception)
+            {
+                stopAction();
+            }
         }
 
         private void ResetBlinkState()
@@ -628,6 +598,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lastMouseDragPulseUtc = DateTime.MinValue;
         private DateTime lastUserInteractionUtc = DateTime.MinValue;
         private const int MouseDragPulseThrottleMs = 20;
+        private const int MousePanPulseThrottleMs = 100;
+        private const int MousePulseCoalesceTtlMs = 1200;
+        private const int MousePulseDiagLogIntervalMs = 5000;
+        private int mouseDragPulseInFlight;
+        private long mouseDragPulseQueuedTicksUtc;
+        private int mousePulseQueuedCount;
+        private int mousePulseSkippedCoalesceCount;
+        private int mousePulseForcedResetCount;
+        private DateTime lastMousePulseDiagLogUtc = DateTime.MinValue;
+        private int mousePulseSkippedThrottleCount;
+        private int mousePulseExecutedCount;
         private const int UserInteractionGraceMs = 200;
         private const int DebugBlinkThrottleMs = 500;
         private DateTime lastLabelRefreshLogTime = DateTime.MinValue;
@@ -901,6 +882,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     armedTargetOffsetTicks = 0;
                     dragFinalizePending = false;
                     lastUserInteractionUtc = DateTime.MinValue;
+                    mouseDragPulseInFlight = 0;
+                    mouseDragPulseQueuedTicksUtc = 0;
+                    mousePulseQueuedCount = 0;
+                    mousePulseSkippedCoalesceCount = 0;
+                    mousePulseForcedResetCount = 0;
+                    mousePulseSkippedThrottleCount = 0;
+                    mousePulseExecutedCount = 0;
+                    lastMousePulseDiagLogUtc = DateTime.MinValue;
                     chartDetachObserved = false;
                     chartDetachObservedTime = DateTime.MinValue;
                     chartDetachObservedContext = null;
@@ -1246,6 +1235,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             StopBlinkTimer();
             DetachChartEventsCore();
+            Interlocked.Exchange(ref mouseDragPulseInFlight, 0);
+            Interlocked.Exchange(ref mouseDragPulseQueuedTicksUtc, 0);
+            mousePulseSkippedThrottleCount = 0;
+            mousePulseExecutedCount = 0;
             entryLineDirty = false;
             stopLineDirty = false;
             targetLineDirty = false;
@@ -1257,7 +1250,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void RunTerminationUiCleanup()
         {
-            DisposeUi(true);
+            // Best-effort async UI cleanup: never block termination on chart dispatcher.
+            DisposeUi(false);
             RemoveAllDrawObjects();
             uiCleanupPending = false;
             uiCleanupPendingSinceUtc = DateTime.MinValue;
@@ -1918,8 +1912,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             stopPrice = sizing.RoundToTick(direction == ArmDirection.Long ? entryPrice - DefaultStopTicks * tick : entryPrice + DefaultStopTicks * tick);
             targetPrice = sizing.RoundToTick(direction == ArmDirection.Long ? entryPrice + DefaultTargetTicks * tick : entryPrice - DefaultTargetTicks * tick);
 
-            bool clamped;
-            EnforceValidity(GetWorkingDirection(), ref stopPrice, ref targetPrice, out clamped);
+            bool entrySideClamped;
+            EnforceLineConstraints(GetWorkingDirection(), ref stopPrice, ref targetPrice, out entrySideClamped);
+            bool marketClamped;
+            EnforceValidity(GetWorkingDirection(), ref stopPrice, ref targetPrice, out marketClamped);
+            bool clamped = entrySideClamped || marketClamped;
 
             if (tick > 0)
             {
@@ -1986,26 +1983,28 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (canMoveTarget)
                     targetPrice = sizing.RoundToTick(entryPrice + armedTargetOffsetTicks * tick);
 
-                bool clamped;
                 double clampedStop = stopPrice;
                 double clampedTarget = targetPrice;
-                EnforceValidity(GetWorkingDirection(), ref clampedStop, ref clampedTarget, out clamped);
-                if (canMoveStop)
-                    stopPrice = clampedStop;
-                if (canMoveTarget)
-                    targetPrice = clampedTarget;
+                bool entrySideClamped;
+                EnforceLineConstraints(GetWorkingDirection(), ref clampedStop, ref clampedTarget, out entrySideClamped);
+                bool marketClamped;
+                EnforceValidity(GetWorkingDirection(), ref clampedStop, ref clampedTarget, out marketClamped);
+                stopPrice = clampedStop;
+                targetPrice = clampedTarget;
 
-                if (canMoveStop && Math.Abs(stopPrice - oldStopPrice) > tick / 8)
+                if (Math.Abs(stopPrice - oldStopPrice) > tick / 8)
                 {
                     stopLineDirty = true;
                     stopLabelDirty = true;
-                    armedStopOffsetTicks = (stopPrice - entryPrice) / tick;
+                    if (canMoveStop || entrySideClamped)
+                        armedStopOffsetTicks = (stopPrice - entryPrice) / tick;
                 }
-                if (canMoveTarget && Math.Abs(targetPrice - oldTargetPrice) > tick / 8)
+                if (Math.Abs(targetPrice - oldTargetPrice) > tick / 8)
                 {
                     targetLineDirty = true;
                     targetLabelDirty = true;
-                    armedTargetOffsetTicks = (targetPrice - entryPrice) / tick;
+                    if (canMoveTarget || entrySideClamped)
+                        armedTargetOffsetTicks = (targetPrice - entryPrice) / tick;
                 }
             }
         }
@@ -2064,15 +2063,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return false;
             MarkUserInteraction();
 
-            bool clamped = false;
+            double stopClamped = stopPrice;
+            double targetClamped = targetPrice;
+            bool clampedToEntry;
+            EnforceLineConstraints(GetWorkingDirection(), ref stopClamped, ref targetClamped, out clampedToEntry);
+            bool clampedToMarket = false;
             if (ShouldClampDraggedLines())
-            {
-                double stop = stopPrice;
-                double target = targetPrice;
-                EnforceValidity(GetWorkingDirection(), ref stop, ref target, out clamped);
-                stopPrice = stop;
-                targetPrice = target;
-            }
+                EnforceValidity(GetWorkingDirection(), ref stopClamped, ref targetClamped, out clampedToMarket);
+            stopPrice = stopClamped;
+            targetPrice = targetClamped;
+            bool clamped = clampedToEntry || clampedToMarket;
             chartLines.SetLinePrice(RiskRayChartLines.LineKind.Stop, stopPrice);
             chartLines.SetLinePrice(RiskRayChartLines.LineKind.Target, targetPrice);
             stopLineDirty = false;
@@ -2121,11 +2121,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (direction == MarketPosition.Flat && !isArmed)
                 return;
 
-            bool clamped = false;
             double stop = stopPrice;
             double target = targetPrice;
+            bool entrySideClamped;
+            EnforceLineConstraints(direction, ref stop, ref target, out entrySideClamped);
+            bool marketClamped = false;
             if (ShouldClampDraggedLines())
-                EnforceValidity(direction, ref stop, ref target, out clamped);
+                EnforceValidity(direction, ref stop, ref target, out marketClamped);
+            bool clamped = entrySideClamped || marketClamped;
 
             if (isStop)
             {
@@ -2197,7 +2200,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             if (clamped)
-                LogClampOnce("Line clamped to stay off-market");
+                LogClampOnce("Line clamped to stay valid");
 
             UpdateLabelsOnly();
         }
@@ -2768,8 +2771,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!EnsureSelfCheckPassed())
                 return;
 
-            bool clamped;
-            EnforceValidity(GetWorkingDirection(), ref stopPrice, ref targetPrice, out clamped);
+            bool clampedToEntry;
+            EnforceLineConstraints(GetWorkingDirection(), ref stopPrice, ref targetPrice, out clampedToEntry);
+            bool clampedToMarket;
+            EnforceValidity(GetWorkingDirection(), ref stopPrice, ref targetPrice, out clampedToMarket);
+            bool clamped = clampedToEntry || clampedToMarket;
             if (clamped)
             {
                 stopLineDirty = true;
@@ -2948,8 +2954,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 : beAnchor - (BreakEvenPlusTicks * sizing.TickSize());
 
             stopPrice = sizing.RoundToTick(newStop);
-            bool clamped;
             double target = targetPrice;
+            bool clamped;
             EnforceValidity(Position.MarketPosition, ref stopPrice, ref target, out clamped);
             if (Math.Abs(target - targetPrice) > sizing.TickSize() / 8)
             {
@@ -3343,6 +3349,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             EnsureHelpers();
             if (!chartLines.HasActiveLines())
                 return;
+            if (!isDraggingStop
+                && !isDraggingTarget
+                && !dragFinalizePending
+                && lastUserInteractionUtc != DateTime.MinValue
+                && (DateTime.UtcNow - lastUserInteractionUtc).TotalMilliseconds < UserInteractionGraceMs)
+                return;
 
             RiskRayHud.Snapshot snapshot = BuildHudSnapshot();
             string entryLabel = hud.GetEntryLabelSafe(snapshot);
@@ -3620,10 +3632,68 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         #region Lines/Draw Objects (helpers)
 
-        // During ARMED pre-entry, allow free manual placement; clamp only once at confirm/live-order phase.
+        // During ARMED pre-entry, allow free manual placement for market-distance rules;
+        // entry-side crossing constraints are enforced separately in EnforceLineConstraints.
         private bool ShouldClampDraggedLines()
         {
             return !(isArmed && !hasPendingEntry && Position.MarketPosition == MarketPosition.Flat);
+        }
+
+        // Keep TP/SL on the correct side of the entry (black) line for the active direction.
+        // LONG: TP >= Entry, SL <= Entry. SHORT: TP <= Entry, SL >= Entry.
+        // When requireOneTickOffset=true, clamps use a 1-tick gap from entry (broker/order-placement compatibility mode).
+        private void EnforceLineConstraints(MarketPosition direction, ref double stop, ref double target, out bool clamped, bool requireOneTickOffset = false)
+        {
+            EnsureHelpers();
+            clamped = false;
+
+            if (direction != MarketPosition.Long && direction != MarketPosition.Short)
+                return;
+            if (sizing == null)
+                return;
+
+            double tick = sizing.TickSize();
+            if (tick <= 0 || double.IsNaN(tick) || double.IsInfinity(tick))
+                return;
+            if (double.IsNaN(entryPrice) || double.IsInfinity(entryPrice) || entryPrice <= 0)
+                return;
+
+            double entryRef = sizing.RoundToTick(entryPrice);
+            double minGap = requireOneTickOffset ? tick : 0;
+            double tolerance = tick / 8;
+
+            if (direction == MarketPosition.Long)
+            {
+                // Long: TP cannot be below entry, SL cannot be above entry.
+                double minTarget = entryRef + minGap;
+                double maxStop = entryRef - minGap;
+                if (target < minTarget - tolerance)
+                {
+                    target = sizing.RoundToTick(minTarget);
+                    clamped = true;
+                }
+                if (stop > maxStop + tolerance)
+                {
+                    stop = sizing.RoundToTick(maxStop);
+                    clamped = true;
+                }
+            }
+            else
+            {
+                // Short: TP cannot be above entry, SL cannot be below entry.
+                double maxTarget = entryRef - minGap;
+                double minStop = entryRef + minGap;
+                if (target > maxTarget + tolerance)
+                {
+                    target = sizing.RoundToTick(maxTarget);
+                    clamped = true;
+                }
+                if (stop < minStop - tolerance)
+                {
+                    stop = sizing.RoundToTick(minStop);
+                    clamped = true;
+                }
+            }
         }
 
         // Clamp stop/target to stay one tick off current bid/ask; protects unmanaged orders from instantly triggering.
@@ -4435,7 +4505,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Hook chart mouse-up on UI thread; actual finalize work is marshaled back to strategy thread.
         private void AttachChartEvents()
         {
-            UiInvoke(() =>
+            UiBeginInvoke(() =>
             {
                 ChartControl currentChart = ChartControl;
                 if (currentChart == null)
@@ -4612,14 +4682,93 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (!isArmed && Position.MarketPosition == MarketPosition.Flat)
                     return;
 
-                double elapsedMs = (DateTime.UtcNow - lastMouseDragPulseUtc).TotalMilliseconds;
-                if (lastMouseDragPulseUtc != DateTime.MinValue && elapsedMs < MouseDragPulseThrottleMs)
+                DateTime nowUtc = DateTime.UtcNow;
+                int throttleMs = (isDraggingStop || isDraggingTarget || dragFinalizePending) ? MouseDragPulseThrottleMs : MousePanPulseThrottleMs;
+                double elapsedMs = (nowUtc - lastMouseDragPulseUtc).TotalMilliseconds;
+                if (lastMouseDragPulseUtc != DateTime.MinValue && elapsedMs < throttleMs)
+                {
+                    Interlocked.Increment(ref mousePulseSkippedThrottleCount);
                     return;
+                }
 
-                lastMouseDragPulseUtc = DateTime.UtcNow;
+                lastMouseDragPulseUtc = nowUtc;
                 MarkUserInteraction();
-                TriggerCustomEvent(_ => SafeExecuteTrade("MouseMoveDragPulse", HandleMouseDragPulse), null);
+                TryQueueMouseDragPulse(nowUtc);
+                MaybeLogMousePulseDiagnostics(nowUtc);
             });
+        }
+
+        // Prevents UI->strategy queue storms during fast pan/scroll:
+        // at most one drag pulse in flight; stale in-flight flag auto-resets via TTL failsafe.
+        private void TryQueueMouseDragPulse(DateTime nowUtc)
+        {
+            if (Volatile.Read(ref mouseDragPulseInFlight) == 1)
+            {
+                long queuedTicksUtc = Interlocked.Read(ref mouseDragPulseQueuedTicksUtc);
+                if (queuedTicksUtc > 0 && nowUtc.Ticks > queuedTicksUtc)
+                {
+                    double queuedMs = (nowUtc.Ticks - queuedTicksUtc) / (double)TimeSpan.TicksPerMillisecond;
+                    if (queuedMs >= MousePulseCoalesceTtlMs && Interlocked.Exchange(ref mouseDragPulseInFlight, 0) == 1)
+                    {
+                        Interlocked.Exchange(ref mouseDragPulseQueuedTicksUtc, 0);
+                        Interlocked.Increment(ref mousePulseForcedResetCount);
+                    }
+                }
+            }
+
+            if (Interlocked.CompareExchange(ref mouseDragPulseInFlight, 1, 0) != 0)
+            {
+                Interlocked.Increment(ref mousePulseSkippedCoalesceCount);
+                return;
+            }
+
+            Interlocked.Exchange(ref mouseDragPulseQueuedTicksUtc, nowUtc.Ticks);
+            Interlocked.Increment(ref mousePulseQueuedCount);
+
+            bool queued = false;
+            try
+            {
+                TriggerCustomEvent(_ => SafeExecuteTrade("MouseMoveDragPulse", () =>
+                {
+                    try
+                    {
+                        Interlocked.Increment(ref mousePulseExecutedCount);
+                        HandleMouseDragPulse();
+                    }
+                    finally
+                    {
+                        Interlocked.Exchange(ref mouseDragPulseInFlight, 0);
+                        Interlocked.Exchange(ref mouseDragPulseQueuedTicksUtc, 0);
+                    }
+                }), null);
+                queued = true;
+            }
+            finally
+            {
+                if (!queued)
+                {
+                    Interlocked.Exchange(ref mouseDragPulseInFlight, 0);
+                    Interlocked.Exchange(ref mouseDragPulseQueuedTicksUtc, 0);
+                }
+            }
+        }
+
+        private void MaybeLogMousePulseDiagnostics(DateTime nowUtc)
+        {
+            if (LogLevelSetting != LogLevelOption.Debug)
+                return;
+            if (lastMousePulseDiagLogUtc != DateTime.MinValue
+                && (nowUtc - lastMousePulseDiagLogUtc).TotalMilliseconds < MousePulseDiagLogIntervalMs)
+                return;
+
+            lastMousePulseDiagLogUtc = nowUtc;
+            int queued = Volatile.Read(ref mousePulseQueuedCount);
+            int skipped = Volatile.Read(ref mousePulseSkippedCoalesceCount);
+            int skippedThrottle = Volatile.Read(ref mousePulseSkippedThrottleCount);
+            int executed = Volatile.Read(ref mousePulseExecutedCount);
+            int forcedResets = Volatile.Read(ref mousePulseForcedResetCount);
+            int inFlight = Volatile.Read(ref mouseDragPulseInFlight);
+            LogDebug($"[UI] MousePulse queued={queued} executed={executed} skippedThrottle={skippedThrottle} skippedCoalesce={skipped} ttlResets={forcedResets} inFlight={inFlight}");
         }
 
         // Poll drag movement on mouse move so TP/SL labels and sizing update even between market ticks.
@@ -4671,15 +4820,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (isDraggingStop || isDraggingTarget)
                 {
-                    bool clamped = false;
+                    double stop = stopPrice;
+                    double target = targetPrice;
+                    bool clampedToEntry;
+                    EnforceLineConstraints(GetWorkingDirection(), ref stop, ref target, out clampedToEntry);
+                    bool clampedToMarket = false;
                     if (ShouldClampDraggedLines())
-                    {
-                        double stop = stopPrice;
-                        double target = targetPrice;
-                        EnforceValidity(GetWorkingDirection(), ref stop, ref target, out clamped);
-                        stopPrice = stop;
-                        targetPrice = target;
-                    }
+                        EnforceValidity(GetWorkingDirection(), ref stop, ref target, out clampedToMarket);
+                    stopPrice = stop;
+                    targetPrice = target;
+                    bool clamped = clampedToEntry || clampedToMarket;
                     if (chartLines != null)
                     {
                         chartLines.SetLinePrice(RiskRayChartLines.LineKind.Stop, stopPrice);
